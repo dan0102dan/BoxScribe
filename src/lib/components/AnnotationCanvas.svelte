@@ -57,6 +57,32 @@
     draw();
   }
 
+  export function focusSelected() {
+    if (!host || !loaded || !selectedId) return;
+    const box = boxes.find((item) => item.id === selectedId);
+    if (!box || box.width <= 0 || box.height <= 0) return;
+    const hostWidth = host.clientWidth, hostHeight = host.clientHeight;
+    const imageFitScale = fitViewport(hostWidth, hostHeight, imageInfo.width, imageInfo.height).scale;
+    const hostAspect = hostWidth / hostHeight;
+    let contextWidth = Math.sqrt(box.width * imageInfo.width);
+    let contextHeight = Math.sqrt(box.height * imageInfo.height);
+    if (contextWidth / contextHeight < hostAspect) contextWidth = contextHeight * hostAspect;
+    else contextHeight = contextWidth / hostAspect;
+    const scale = Math.max(imageFitScale, Math.min(hostWidth / contextWidth, hostHeight / contextHeight));
+    const scaledWidth = imageInfo.width * scale, scaledHeight = imageInfo.height * scale;
+    const centeredX = hostWidth / 2 - (box.x + box.width / 2) * scale;
+    const centeredY = hostHeight / 2 - (box.y + box.height / 2) * scale;
+    const edgeSpaceX = box.width * scale / 2;
+    const edgeSpaceY = box.height * scale / 2;
+    viewport = {
+      scale,
+      offsetX: scaledWidth <= hostWidth ? (hostWidth - scaledWidth) / 2 : clamp(centeredX, hostWidth - scaledWidth - edgeSpaceX, edgeSpaceX),
+      offsetY: scaledHeight <= hostHeight ? (hostHeight - scaledHeight) / 2 : clamp(centeredY, hostHeight - scaledHeight - edgeSpaceY, edgeSpaceY)
+    };
+    dispatch('viewport', Math.round(scale * 100));
+    draw();
+  }
+
   function draw() {
     if (!ctx || !host) return;
     const w = host.clientWidth, h = host.clientHeight;
