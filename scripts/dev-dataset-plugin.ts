@@ -289,8 +289,15 @@ export function datasetDevPlugin(): Plugin {
           if (url.pathname === '/__boxscribe/exclude' && req.method === 'PUT') {
             const payload = await body(req);
             const excluded = payload.excluded !== false;
+            const viewedRecord = typeof payload.currentId === 'string' ? findRecord(index, payload.currentId) : undefined;
+            const previousIndex = record.index;
             const changed = excluded && !record.excluded ? await excludeRecord(index, record) : !excluded && record.excluded ? await restoreRecord(index, record) : record;
-            return sendJson(res, { ok: true, image: item(changed), activeImages: index.records.length, annotatedCount: index.annotatedCount, excludedCount: index.excludedRecords.length });
+            const nextRecord = viewedRecord && viewedRecord !== record
+              ? viewedRecord
+              : excluded
+                ? index.records[Math.min(previousIndex, index.records.length - 1)]
+                : index.excludedRecords[Math.min(previousIndex, index.excludedRecords.length - 1)];
+            return sendJson(res, { ok: true, image: item(changed), nextImage: nextRecord ? item(nextRecord) : null, activeImages: index.records.length, annotatedCount: index.annotatedCount, excludedCount: index.excludedRecords.length });
           }
           if (url.pathname === '/__boxscribe/image') {
             const source = sourcePath(index, record);

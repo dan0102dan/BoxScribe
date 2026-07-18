@@ -23,6 +23,8 @@
   let savedAt = '';
   let exporting = false;
   let togglingExcludedId: string | null = null;
+  let loadingFrame: { id: string; name: string } | null = null;
+  let frameRequestSequence = 0;
   let search = '';
   let filter: 'all' | 'annotated' | 'unannotated' | 'empty' | 'excluded' = 'all';
   let classFilters: number[] = [];
@@ -63,7 +65,7 @@
 
   const formatCount = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
 
-  async function loadRuntimeProject(query = '') {
+  async function loadRuntimeProject(query = '', preferredImage: typeof project.images[number] | null = null) {
     saveError = '';
     try {
       const classQuery = classFilters.length ? `&classIds=${classFilters.join(',')}` : '';
@@ -73,7 +75,11 @@
       if (!response.ok) throw new Error(body.message);
       project = body;
       currentId = null;
-      if (body.images[0]) await openImage(body.images[0].id);
+      if (preferredImage && !project.images.some((image) => image.id === preferredImage.id)) {
+        project = { ...project, images: [...project.images, preferredImage].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+      }
+      const target = preferredImage ?? body.images[0] ?? null;
+      if (target) await openImage(target.id);
     } catch (error) { saveError = error instanceof Error ? error.message : 'Не удалось открыть датасет'; }
   }
 
@@ -188,18 +194,39 @@
   }
 
   async function openImage(id: string) {
-    if (id === currentId) return;
-    if (dirty && !await save()) return;
+    if (id === currentId && !loadingFrame) return;
+    const request = ++frameRequestSequence;
     const target = project.images.find((image) => image.id === id);
-    if (runtimeDataset && target) {
-      try {
+    if (!target) { loadingFrame = null; return; }
+    loadingFrame = { id, name: target.name };
+    let awaitingCanvas = false;
+    try {
+      if (dirty && !await save()) return;
+      if (request !== frameRequestSequence) return;
+      if (runtimeDataset) {
         const body = await prepareRuntimeFrame(target);
+        if (request !== frameRequestSequence) return;
+        awaitingCanvas = true;
         currentId = id; boxes = body.boxes; selectedId = null; dirty = false; history.reset(); savedAt = body.saved ? 'Из YOLO TXT' : '';
         project = { ...project, images: project.images.map((image) => image.id === id ? body.image : image) };
         localStorage.setItem('boxscribe:last-image', id);
         void preloadNeighbor(target, -1); void preloadNeighbor(target, 1);
-      } catch (error) { saveError = error instanceof Error ? error.message : 'Ошибка загрузки'; }
-    } else { currentId = id; await loadAnnotations(); }
+      } else {
+        awaitingCanvas = true;
+        currentId = id;
+        await loadAnnotations();
+      }
+    } catch (error) {
+      if (request === frameRequestSequence) saveError = error instanceof Error ? error.message : 'Ошибка загрузки';
+    } finally {
+      if (request === frameRequestSequence && !awaitingCanvas) loadingFrame = null;
+    }
+  }
+
+  function finishFrameLoading(url: string, failed = false) {
+    if (!currentImage || !loadingFrame || loadingFrame.id !== currentImage.id || url !== frameUrl(currentImage)) return;
+    loadingFrame = null;
+    if (failed) saveError = 'Не удалось отобразить изображение';
   }
 
   async function openIndex(targetIndex: number) {
@@ -263,11 +290,11 @@
     if (image.id === currentId && dirty && !await save()) return;
     togglingExcludedId = image.id; saveError = '';
     try {
-      const response = await fetch(`/__boxscribe/exclude?id=${encodeURIComponent(image.id)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ excluded: !image.excluded }) });
+      const response = await fetch(`/__boxscribe/exclude?id=${encodeURIComponent(image.id)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ excluded: !image.excluded, currentId }) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.message);
       frameCache.clear();
-      await loadRuntimeProject(search);
+      await loadRuntimeProject(search, body.nextImage ?? null);
     } catch (error) { saveError = error instanceof Error ? error.message : 'Не удалось изменить статус кадра'; }
     finally { togglingExcludedId = null; }
   }
@@ -406,10 +433,11 @@
     </aside>
     <section class="workspace">
       {#if currentImage}
-        <AnnotationCanvas bind:this={canvas} imageUrl={frameUrl(currentImage)} imageInfo={currentImage} {boxes} {selectedId} {currentClass} classes={project.classes} {showLabels} readOnly={Boolean(currentImage.excluded)} on:change={(e) => updateBoxes(e.detail)} on:commit={commit} on:select={(e) => selectBox(e.detail)} on:viewport={(e) => zoom = e.detail}/>
+        {#key currentImage.id}<AnnotationCanvas bind:this={canvas} imageUrl={frameUrl(currentImage)} imageInfo={currentImage} {boxes} {selectedId} {currentClass} classes={project.classes} {showLabels} readOnly={Boolean(currentImage.excluded)} on:change={(e) => updateBoxes(e.detail)} on:commit={commit} on:select={(e) => selectBox(e.detail)} on:viewport={(e) => zoom = e.detail} on:ready={(e) => finishFrameLoading(e.detail)} on:loaderror={(e) => finishFrameLoading(e.detail, true)}/>{/key}
         <div class="canvas-tools"><button on:click={() => canvas.fit()} title="Показать весь кадр (F)"><Icon name="fit"/></button><button class:active={showLabels} on:click={() => showLabels = !showLabels} title="Подписи"><Icon name="eye"/></button><span>{zoom}%</span></div>
         <div class="nav-controls"><button on:click={() => navigate(-1)} disabled={(currentImage.index ?? 0) === 0}><span class="arrow">←</span><kbd>A</kbd></button><span class="counter"><input type="text" inputmode="numeric" pattern="[0-9]*" value={(currentImage.index ?? project.images.findIndex((i) => i.id === currentId)) + 1} aria-label="Перейти к номеру кадра" on:focus={placeFrameCaretAtEnd} on:pointerdown={placeFrameCaretAtEnd} on:change={jumpToFrame} on:keydown={frameInputKey}/><small>/ {totalImages}</small></span><button on:click={() => navigate(1)} disabled={(currentImage.index ?? project.images.findIndex((i) => i.id === currentId)) >= totalImages - 1}><kbd>D</kbd><span class="arrow">→</span></button></div>
       {/if}
+      {#if loadingFrame}<div class="frame-loading" role="status" aria-live="polite"><div><i class="spinner"></i><span>Загрузка кадра</span><small>{loadingFrame.name}</small></div></div>{/if}
     </section>
     <aside class="inspector">
       <div class="panel-head class-mode"><span>{selectedBox ? 'Класс выбранного bbox' : 'Класс нового bbox'}</span><small>{selectedBox ? 'EDIT' : 'DRAW'}</small></div>
@@ -436,6 +464,7 @@
   .selection-card>div>span:first-child{display:flex;align-items:center;gap:5px}.selection-card>div>span:first-child b{color:#aeb5bc;font:650 9px ui-monospace;letter-spacing:0}.selection-actions{display:flex;align-items:center;gap:2px}.selection-actions button{width:24px;height:25px;display:grid;place-items:center;border-radius:5px}.selection-actions .box-previous :global(svg){transform:rotate(180deg)}.selection-actions .focus-selected:hover,.selection-actions button:not(.remove-selected):hover{color:#e9ff70;background:#e9ff7010}.selection-actions .remove-selected{margin-left:2px}.selection-actions .remove-selected:hover{background:#ff8d7210}
   .selection-actions button{padding:0;line-height:0}.selection-actions button :global(svg){display:block;margin:auto}
   .workspace{overflow:hidden;isolation:isolate}.canvas-tools,.nav-controls{z-index:2}
+  .frame-loading{position:absolute;inset:0;z-index:4;display:grid;place-items:center;background:#11141966;backdrop-filter:blur(12px) saturate(.72);animation:loading-in .14s ease-out;color:#aeb5bc}.frame-loading>div{min-width:190px;max-width:min(420px,60%);padding:14px 18px;border:1px solid #343a42;background:#15191ee8;border-radius:10px;box-shadow:0 12px 34px #0008;display:grid;grid-template-columns:20px minmax(0,1fr);align-items:center;column-gap:10px;row-gap:3px}.frame-loading .spinner{grid-row:1/3;width:17px;height:17px}.frame-loading span{font-size:11px;font-weight:650}.frame-loading small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#68717a;font:9px ui-monospace}@keyframes loading-in{from{opacity:0;backdrop-filter:blur(0) saturate(1)}to{opacity:1;backdrop-filter:blur(12px) saturate(.72)}}
   .filter-block{padding:9px 12px 10px;border-top:1px solid #252a30;border-bottom:1px solid #252a30;background:#15191e}.filter-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}.filter-title>span,.status-filter>span,.status-locked>span{color:#666e76;font:650 8px ui-monospace;text-transform:uppercase;letter-spacing:.12em}.filter-title>small{color:#50575f;font:600 8px ui-monospace}.object-filter .class-filters{padding:0;gap:5px}.status-filter{padding:8px 12px 10px;display:grid;grid-template-columns:45px 1fr;align-items:center;gap:5px}.status-filter .filters{padding:0;gap:2px}.status-filter .filters button{padding:5px 6px}.status-locked{height:39px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #252a30}.status-locked>b{display:flex;align-items:center;gap:6px;color:#8d959d;font-size:9px;font-weight:600}.status-locked>b i{width:6px;height:6px;border-radius:50%;background:#77e6a1;box-shadow:0 0 0 3px #77e6a112}
   .status-filter{align-items:center}.status-filter .filters{min-width:0;overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}.status-filter .filters::-webkit-scrollbar{display:none}.status-filter .filters button{flex:none;white-space:nowrap}.image-row{position:relative;min-height:58px;border-bottom:1px solid #22262b;display:flex;align-items:center;background:transparent}.image-row:hover{background:#1a1e24}.image-row.active{background:#20252b;box-shadow:inset 3px 0 #e9ff70}.image-row.excluded:not(.active){background:#17191d}.image-row.excluded .file b{color:#848b92;text-decoration:line-through;text-decoration-color:#596067}.image-row.excluded .status{opacity:.5}.image-open{min-width:0;flex:1;align-self:stretch;padding:10px 4px 10px 11px;border:0;background:transparent;color:#cfd3d7;text-align:left;display:flex;align-items:center;gap:9px;cursor:pointer}.exclude-toggle{width:26px;height:28px;padding:0;flex:none;display:grid;place-items:center;border:0;border-radius:5px;background:transparent;color:#555d65;cursor:pointer}.exclude-toggle:hover{background:#ff8d7210;color:#ff8d72}.exclude-toggle.active{color:#ff8d72;background:#ff8d720c}.exclude-toggle.active:hover{color:#e9ff70;background:#e9ff7010}.exclude-toggle:disabled{opacity:.45;cursor:wait}.image-row .number{width:32px;padding-right:9px;text-align:right;flex:none}
   @media(max-width:1100px){.app-shell{--side:220px;--inspect:220px}}

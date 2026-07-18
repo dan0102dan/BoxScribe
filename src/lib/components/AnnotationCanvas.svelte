@@ -17,12 +17,15 @@
     commit: { before: BoundingBox[]; boxes: BoundingBox[] };
     select: string | null;
     viewport: number;
+    ready: string;
+    loaderror: string;
   }>();
   let canvas: HTMLCanvasElement;
   let host: HTMLDivElement;
   let ctx: CanvasRenderingContext2D;
   let image = new Image();
   let loaded = false;
+  let imageLoadSequence = 0;
   let viewport: Viewport = { scale: 1, offsetX: 0, offsetY: 0 };
   let spaceDown = false;
   let action: null | { type: 'pan' | 'create' | 'move' | 'resize'; startX: number; startY: number; before: BoundingBox[]; box?: BoundingBox; handle?: string; startViewport?: Viewport } = null;
@@ -32,10 +35,16 @@
   $: if (ctx && loaded && boxes && selectedId !== undefined && showLabels !== undefined) draw();
 
   function loadImage(url: string) {
+    const request = ++imageLoadSequence;
     loaded = false;
-    image = new Image();
-    image.onload = () => { loaded = true; fit(); };
-    image.src = url;
+    draw();
+    const candidate = new Image();
+    candidate.onload = () => {
+      if (request !== imageLoadSequence || url !== imageUrl) return;
+      image = candidate; loaded = true; fit(); dispatch('ready', url);
+    };
+    candidate.onerror = () => { if (request === imageLoadSequence && url === imageUrl) dispatch('loaderror', url); };
+    candidate.src = url;
   }
 
   function resize() {
