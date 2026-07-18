@@ -13,6 +13,7 @@ export interface ImageItem {
   width: number;
   height: number;
   annotated: boolean;
+  excluded?: boolean;
   empty: boolean;
   boxCount: number;
   assetPath: string;
@@ -27,6 +28,7 @@ export interface ProjectState {
   lastImageId: string | null;
   totalImages?: number;
   annotatedCount?: number;
+  activeImages?: number;
 }
 
 export interface Viewport {

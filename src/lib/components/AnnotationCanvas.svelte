@@ -10,6 +10,7 @@
   export let currentClass = 0;
   export let classes: string[] = [];
   export let showLabels = true;
+  export let readOnly = false;
 
   const dispatch = createEventDispatcher<{
     change: BoundingBox[];
@@ -152,6 +153,7 @@
     if (spaceDown || event.button === 1) {
       action = { type: 'pan', startX: p.x, startY: p.y, before, startViewport: { ...viewport } }; return;
     }
+    if (readOnly) { dispatch('select', hitBox(p.x, p.y)?.id ?? null); return; }
     const handle = selectedHandle(p.x, p.y);
     if (handle) {
       const box = boxes.find((b) => b.id === selectedId)!;

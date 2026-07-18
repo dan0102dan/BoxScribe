@@ -1,13 +1,13 @@
 import { createReadStream } from 'node:fs';
-import { mkdir, open, readFile, readdir, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin } from 'vite';
 import { imageSize } from 'image-size';
 import YAML from 'yaml';
 
-type RecordItem = { relative: string; splitIndex: number; index: number; annotated: boolean; boxCount?: number; classIds?: number[] };
-type DatasetIndex = { root: string; classes: string[]; splitDirs: string[]; records: RecordItem[]; annotatedCount: number };
+type RecordItem = { relative: string; splitIndex: number; index: number; annotated: boolean; excluded?: boolean; sourceOverride?: string; labelOverride?: string; boxCount?: number; classIds?: number[] };
+type DatasetIndex = { root: string; classes: string[]; splitDirs: string[]; records: RecordItem[]; excludedRecords: RecordItem[]; annotatedCount: number };
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
 const contentTypes: Record<string, string> = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.bmp': 'image/bmp' };
 
@@ -15,7 +15,10 @@ async function scanDirectory(directory: string, root = directory) {
   const images: string[] = [], labels = new Set<string>(), pending = [directory];
   while (pending.length) {
     const current = pending.pop()!;
-    for (const entry of await readdir(current, { withFileTypes: true })) {
+    let entries;
+    try { entries = await readdir(current, { withFileTypes: true }); }
+    catch (error: any) { if (error?.code === 'ENOENT') continue; throw error; }
+    for (const entry of entries) {
       if (entry.name.startsWith('.')) continue;
       const full = path.join(current, entry.name);
       if (entry.isDirectory()) pending.push(full);
@@ -31,6 +34,34 @@ async function scanDirectory(directory: string, root = directory) {
   return { images, labels };
 }
 
+function splitName(index: Pick<DatasetIndex, 'splitDirs'>, splitIndex: number) {
+  const splitDir = index.splitDirs[splitIndex];
+  const name = path.basename(splitDir);
+  return name === 'images' ? path.basename(path.dirname(splitDir)) : name || `split-${splitIndex}`;
+}
+
+function usesSeparateLabels(splitDir: string) {
+  return splitDir.split(path.sep).lastIndexOf('images') >= 0;
+}
+
+function pairedLabelsDir(splitDir: string) {
+  const parts = splitDir.split(path.sep);
+  const imagesIndex = parts.lastIndexOf('images');
+  if (imagesIndex < 0) return splitDir;
+  parts[imagesIndex] = 'labels';
+  return parts.join(path.sep);
+}
+
+function excludedPaths(index: DatasetIndex, record: RecordItem) {
+  const parsed = path.parse(record.relative);
+  const root = path.join(index.root, '.boxscribe', 'excluded', splitName(index, record.splitIndex));
+  if (usesSeparateLabels(index.splitDirs[record.splitIndex])) return {
+    image: path.join(root, 'images', record.relative),
+    label: path.join(root, 'labels', parsed.dir, `${parsed.name}.txt`)
+  };
+  return { image: path.join(root, record.relative), label: path.join(root, parsed.dir, `${parsed.name}.txt`) };
+}
+
 async function buildIndex(): Promise<DatasetIndex> {
   const root = path.resolve(process.env.BOXSCRIBE_DATASET_DIR || 'demo-dataset');
   const yamlPath = path.join(root, 'data.yaml');
@@ -44,29 +75,42 @@ async function buildIndex(): Promise<DatasetIndex> {
   const records: RecordItem[] = [];
   for (let splitIndex = 0; splitIndex < splitDirs.length; splitIndex++) {
     const splitDir = splitDirs[splitIndex];
-    const splitKey = `${splitIndex}-${path.basename(splitDir)}`;
     const scanned = await scanDirectory(splitDir);
+    const labels = usesSeparateLabels(splitDir) ? (await scanDirectory(pairedLabelsDir(splitDir))).labels : scanned.labels;
     for (const relative of scanned.images) {
       const stem = relative.slice(0, -path.extname(relative).length);
-      records.push({ relative, splitIndex, index: records.length, annotated: scanned.labels.has(stem) });
+      records.push({ relative, splitIndex, index: records.length, annotated: labels.has(stem) });
     }
   }
-  return { root, classes, splitDirs, records, annotatedCount: records.filter((record) => record.annotated).length };
+  const shell: DatasetIndex = { root, classes, splitDirs, records, excludedRecords: [], annotatedCount: records.filter((record) => record.annotated).length };
+  for (let splitIndex = 0; splitIndex < splitDirs.length; splitIndex++) {
+    const excludedSplit = path.join(root, '.boxscribe', 'excluded', splitName(shell, splitIndex));
+    const separate = usesSeparateLabels(splitDirs[splitIndex]);
+    const imageRoot = separate ? path.join(excludedSplit, 'images') : excludedSplit;
+    const labelRoot = separate ? path.join(excludedSplit, 'labels') : excludedSplit;
+    const scanned = await scanDirectory(imageRoot);
+    const labels = separate ? (await scanDirectory(labelRoot)).labels : scanned.labels;
+    for (const relative of scanned.images) {
+      const parsed = path.parse(relative), label = path.join(labelRoot, parsed.dir, `${parsed.name}.txt`);
+      shell.excludedRecords.push({ relative, splitIndex, index: shell.excludedRecords.length, annotated: labels.has(path.join(parsed.dir, parsed.name)), excluded: true, sourceOverride: path.join(imageRoot, relative), labelOverride: label });
+    }
+  }
+  return shell;
 }
 
 function sourcePath(index: DatasetIndex, record: RecordItem) {
-  return path.join(index.splitDirs[record.splitIndex], record.relative);
+  return record.sourceOverride || path.join(index.splitDirs[record.splitIndex], record.relative);
 }
 
 function labelCandidates(index: DatasetIndex, record: RecordItem) {
+  if (record.excluded) return record.labelOverride ? [record.labelOverride] : [];
   const parsed = path.parse(record.relative);
   const splitDir = index.splitDirs[record.splitIndex];
   const adjacent = path.join(splitDir, parsed.dir, `${parsed.name}.txt`);
   const parts = splitDir.split(path.sep);
   const imagesIndex = parts.lastIndexOf('images');
   if (imagesIndex < 0) return [adjacent];
-  parts[imagesIndex] = 'labels';
-  return [adjacent, path.join(parts.join(path.sep), parsed.dir, `${parsed.name}.txt`)];
+  return [adjacent, path.join(pairedLabelsDir(splitDir), parsed.dir, `${parsed.name}.txt`)];
 }
 
 async function labelPath(index: DatasetIndex, record: RecordItem) {
@@ -74,6 +118,63 @@ async function labelPath(index: DatasetIndex, record: RecordItem) {
     try { await open(candidate, 'r').then((handle) => handle.close()); return candidate; } catch { /* try next */ }
   }
   return labelCandidates(index, record).at(-1)!;
+}
+
+async function pathExists(target: string | undefined) {
+  if (!target) return false;
+  try { await open(target, 'r').then((handle) => handle.close()); return true; } catch { return false; }
+}
+
+async function moveFile(source: string, target: string) {
+  if (await pathExists(target)) throw new Error(`Файл уже существует: ${target}`);
+  await mkdir(path.dirname(target), { recursive: true });
+  try { await rename(source, target); }
+  catch (error: any) {
+    if (error?.code !== 'EXDEV') throw error;
+    await copyFile(source, target);
+    try { await unlink(source); } catch (unlinkError) { try { await unlink(target); } catch { /* preserve error */ } throw unlinkError; }
+  }
+}
+
+function reindex(records: RecordItem[]) { records.forEach((record, index) => { record.index = index; }); }
+function sortRecords(records: RecordItem[]) { records.sort((a, b) => a.splitIndex - b.splitIndex || a.relative.localeCompare(b.relative, undefined, { numeric: true })); reindex(records); }
+
+async function excludeRecord(index: DatasetIndex, record: RecordItem) {
+  await hydrateLabel(index, record);
+  const source = sourcePath(index, record), label = await labelPath(index, record), hasLabel = await pathExists(label);
+  const target = excludedPaths(index, record);
+  const moved: Array<[string, string]> = [];
+  try {
+    await moveFile(source, target.image); moved.push([source, target.image]);
+    if (hasLabel) { await moveFile(label, target.label); moved.push([label, target.label]); }
+  } catch (error) {
+    for (const [original, excluded] of moved.reverse()) try { await moveFile(excluded, original); } catch { /* preserve original error */ }
+    throw error;
+  }
+  index.records.splice(record.index, 1); reindex(index.records);
+  const excluded: RecordItem = { ...record, index: index.excludedRecords.length, excluded: true, sourceOverride: target.image, labelOverride: target.label, annotated: hasLabel };
+  index.excludedRecords.push(excluded); sortRecords(index.excludedRecords);
+  if (record.annotated) index.annotatedCount = Math.max(0, index.annotatedCount - 1);
+  return excluded;
+}
+
+async function restoreRecord(index: DatasetIndex, record: RecordItem) {
+  const source = sourcePath(index, record), hasLabel = await pathExists(record.labelOverride);
+  const active: RecordItem = { ...record, excluded: false, sourceOverride: undefined, labelOverride: undefined, annotated: hasLabel };
+  const targetImage = path.join(index.splitDirs[record.splitIndex], record.relative);
+  const targetLabel = labelCandidates(index, active).at(-1)!;
+  const moved: Array<[string, string]> = [];
+  try {
+    await moveFile(source, targetImage); moved.push([source, targetImage]);
+    if (hasLabel && record.labelOverride) { await moveFile(record.labelOverride, targetLabel); moved.push([record.labelOverride, targetLabel]); }
+  } catch (error) {
+    for (const [excluded, original] of moved.reverse()) try { await moveFile(original, excluded); } catch { /* preserve original error */ }
+    throw error;
+  }
+  index.excludedRecords.splice(record.index, 1); reindex(index.excludedRecords);
+  index.records.push(active); sortRecords(index.records);
+  if (active.annotated) index.annotatedCount++;
+  return active;
 }
 
 async function hydrateLabel(index: DatasetIndex, record: RecordItem) {
@@ -117,7 +218,14 @@ function serializeYolo(boxes: any[], width: number, height: number) {
 }
 
 function item(record: RecordItem) {
-  return { id: String(record.index), name: path.basename(record.relative), width: 0, height: 0, annotated: record.annotated, empty: record.annotated && record.boxCount === 0, boxCount: record.boxCount ?? -1, assetPath: '', index: record.index };
+  const id = record.excluded ? `x:${record.splitIndex}:${encodeURIComponent(record.relative)}` : String(record.index);
+  return { id, name: path.basename(record.relative), width: 0, height: 0, annotated: record.annotated, excluded: Boolean(record.excluded), empty: record.annotated && record.boxCount === 0, boxCount: record.boxCount ?? -1, assetPath: '', index: record.index };
+}
+
+function findRecord(index: DatasetIndex, id: string) {
+  if (id.startsWith('x:')) return index.excludedRecords.find((record) => item(record).id === id);
+  const numeric = Number(id);
+  return Number.isInteger(numeric) && String(numeric) === id ? index.records[numeric] : undefined;
 }
 
 function sendJson(res: ServerResponse, value: unknown, status = 200) {
@@ -144,36 +252,46 @@ export function datasetDevPlugin(): Plugin {
           const index = await getIndex();
           if (url.pathname === '/__boxscribe/project') {
             const query = (url.searchParams.get('query') || '').toLowerCase();
+            const status = url.searchParams.get('status') || 'all';
             const requiredClassIds = (url.searchParams.get('classIds') || '').split(',').filter(Boolean).map(Number).filter(Number.isInteger);
             const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
             const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
-            if (requiredClassIds.length) await hydrateLabels(index, index.records);
-            const source = index.records.filter((record) => (!query || record.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => record.classIds?.includes(classId)));
+            const records = status === 'excluded' ? index.excludedRecords : index.records;
+            if (requiredClassIds.length) await hydrateLabels(index, records);
+            const source = records.filter((record) => (!query || record.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => record.classIds?.includes(classId)));
             const page = source.slice(offset, offset + limit);
             await hydrateLabels(index, page);
-            return sendJson(res, { name: path.basename(index.root), imageDir: index.root, classes: index.classes, images: page.map(item), lastImageId: source[0] ? String(source[0].index) : null, totalImages: index.records.length, annotatedCount: index.annotatedCount, resultCount: source.length });
+            const first = source[0];
+            return sendJson(res, { name: path.basename(index.root), imageDir: index.root, classes: index.classes, images: page.map(item), lastImageId: first ? item(first).id : null, totalImages: records.length, activeImages: index.records.length, annotatedCount: index.annotatedCount, resultCount: source.length, excludedCount: index.excludedRecords.length });
           }
           if (url.pathname === '/__boxscribe/item') {
             const record = index.records[Number(url.searchParams.get('index'))];
             return record ? sendJson(res, item(record)) : sendJson(res, { message: 'Кадр не найден' }, 404);
           }
           if (url.pathname === '/__boxscribe/neighbor') {
-            const currentIndex = Number(url.searchParams.get('id'));
+            const currentId = url.searchParams.get('id') || '';
             const direction = Number(url.searchParams.get('direction')) < 0 ? -1 : 1;
             const query = (url.searchParams.get('query') || '').toLowerCase();
+            const status = url.searchParams.get('status') || 'active';
             const requiredClassIds = (url.searchParams.get('classIds') || '').split(',').filter(Boolean).map(Number).filter(Number.isInteger);
-            if (requiredClassIds.length) await hydrateLabels(index, index.records);
-            const source = index.records.filter((candidate) => (!query || candidate.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => candidate.classIds?.includes(classId)));
-            const position = source.findIndex((candidate) => candidate.index === currentIndex);
+            const records = status === 'excluded' ? index.excludedRecords : index.records;
+            if (requiredClassIds.length) await hydrateLabels(index, records);
+            const source = records.filter((candidate) => (!query || candidate.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => candidate.classIds?.includes(classId)));
+            const position = source.findIndex((candidate) => item(candidate).id === currentId);
             const neighbor = position >= 0 ? source[position + direction] : undefined;
             if (!neighbor) return sendJson(res, { message: 'Соседний кадр не найден' }, 404);
             await hydrateLabel(index, neighbor);
             return sendJson(res, item(neighbor));
           }
           const rawId = url.searchParams.get('id') || '';
-          const numericId = Number(rawId);
-          const record = Number.isInteger(numericId) && String(numericId) === rawId ? index.records[numericId] : undefined;
+          const record = findRecord(index, rawId);
           if (!record) return sendJson(res, { message: 'Кадр не найден' }, 404);
+          if (url.pathname === '/__boxscribe/exclude' && req.method === 'PUT') {
+            const payload = await body(req);
+            const excluded = payload.excluded !== false;
+            const changed = excluded && !record.excluded ? await excludeRecord(index, record) : !excluded && record.excluded ? await restoreRecord(index, record) : record;
+            return sendJson(res, { ok: true, image: item(changed), activeImages: index.records.length, annotatedCount: index.annotatedCount, excludedCount: index.excludedRecords.length });
+          }
           if (url.pathname === '/__boxscribe/image') {
             const source = sourcePath(index, record);
             res.statusCode = 200; res.setHeader('content-type', contentTypes[path.extname(source).toLowerCase()] || 'application/octet-stream'); res.setHeader('cache-control', 'private, max-age=3600');
@@ -186,6 +304,7 @@ export function datasetDevPlugin(): Plugin {
             return sendJson(res, { boxes: parseYolo(text, size.width, size.height), saved, image: { ...item(record), width: size.width, height: size.height, annotated: saved, empty: saved && !text.trim(), boxCount: text.split(/\r?\n/).filter(Boolean).length } });
           }
           if (url.pathname === '/__boxscribe/annotations' && req.method === 'PUT') {
+            if (record.excluded) return sendJson(res, { message: 'Сначала верните кадр в датасет' }, 409);
             const payload = await body(req), size = await dimensions(sourcePath(index, record)), target = await labelPath(index, record);
             await mkdir(path.dirname(target), { recursive: true });
             const text = serializeYolo(Array.isArray(payload.boxes) ? payload.boxes : [], size.width, size.height);
