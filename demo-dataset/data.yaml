@@ -1,0 +1,7 @@
+path: .
+train: train
+val: train
+nc: 2
+names:
+  0: fox
+  1: bird
