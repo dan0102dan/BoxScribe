@@ -65,12 +65,21 @@
 
   const formatCount = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
 
+  function runtimeScope() {
+    return { query: search, status: filter === 'excluded' ? 'excluded' : 'active', classIds: classFilters };
+  }
+
+  function runtimeParams(extra: Record<string, string | number> = {}) {
+    const scope = runtimeScope();
+    const params = new URLSearchParams({ query: scope.query, status: scope.status, ...Object.fromEntries(Object.entries(extra).map(([key, value]) => [key, String(value)])) });
+    if (scope.classIds.length) params.set('classIds', scope.classIds.join(','));
+    return params;
+  }
+
   async function loadRuntimeProject(query = '', preferredImage: typeof project.images[number] | null = null) {
     saveError = '';
     try {
-      const classQuery = classFilters.length ? `&classIds=${classFilters.join(',')}` : '';
-      const statusQuery = filter === 'excluded' ? '&status=excluded' : '';
-      const response = await fetch(`/__boxscribe/project?limit=200&query=${encodeURIComponent(query)}${classQuery}${statusQuery}`);
+      const response = await fetch(`/__boxscribe/project?${runtimeParams({ limit: 200, query })}`);
       const body = await response.json();
       if (!response.ok) throw new Error(body.message);
       project = body;
@@ -137,9 +146,7 @@
 
   async function preloadNeighbor(current: typeof project.images[number], direction: number) {
     if (!runtimeDataset) return;
-    const classQuery = classFilters.length ? `&classIds=${classFilters.join(',')}` : '';
-    const statusQuery = filter === 'excluded' ? '&status=excluded' : '';
-    const response = await fetch(`/__boxscribe/neighbor?id=${encodeURIComponent(current.id)}&direction=${direction}&query=${encodeURIComponent(search)}${classQuery}${statusQuery}`);
+    const response = await fetch(`/__boxscribe/neighbor?${runtimeParams({ id: current.id, direction })}`);
     if (!response.ok) return;
     const image: typeof project.images[number] = await response.json();
     prepareRuntimeFrame(image!).catch(() => frameCache.delete(image!.id));
@@ -168,6 +175,7 @@
 
   async function save() {
     if (!project || !currentId || saving) return true;
+    if (currentImage?.excluded) return true;
     clearTimeout(autosaveTimer); saving = true; saveError = '';
     try {
       const item = project.images.find((image) => image.id === currentId);
@@ -243,9 +251,7 @@
     if (!project || !currentId) return;
     const current = project.images.find((image) => image.id === currentId);
     if (runtimeDataset && current) {
-      const classQuery = classFilters.length ? `&classIds=${classFilters.join(',')}` : '';
-      const statusQuery = filter === 'excluded' ? '&status=excluded' : '';
-      const response = await fetch(`/__boxscribe/neighbor?id=${encodeURIComponent(current.id)}&direction=${direction}&query=${encodeURIComponent(search)}${classQuery}${statusQuery}`);
+      const response = await fetch(`/__boxscribe/neighbor?${runtimeParams({ id: current.id, direction })}`);
       if (!response.ok) return;
       const next = await response.json();
       if (!project.images.some((image) => image.id === next.id)) project = { ...project, images: [...project.images, next].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
@@ -290,7 +296,7 @@
     if (image.id === currentId && dirty && !await save()) return;
     togglingExcludedId = image.id; saveError = '';
     try {
-      const response = await fetch(`/__boxscribe/exclude?id=${encodeURIComponent(image.id)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ excluded: !image.excluded, currentId }) });
+      const response = await fetch(`/__boxscribe/exclude?id=${encodeURIComponent(image.id)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ excluded: !image.excluded, currentId, ...runtimeScope() }) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.message);
       frameCache.clear();
@@ -338,14 +344,14 @@
     await focusCurrent();
   }
 
-  function undo() { const previous = history.undo(boxes); if (previous) { boxes = previous; selectedId = null; markDirty(); } }
-  function redo() { const next = history.redo(boxes); if (next) { boxes = next; selectedId = null; markDirty(); } }
+  function undo() { if (currentImage?.excluded) return; const previous = history.undo(boxes); if (previous) { boxes = previous; selectedId = null; markDirty(); } }
+  function redo() { if (currentImage?.excluded) return; const next = history.redo(boxes); if (next) { boxes = next; selectedId = null; markDirty(); } }
 
   async function downloadBundle() {
     if (!currentImage) return;
     exporting = true; saveError = '';
     try {
-      if (!await save()) throw new Error('Сначала сохраните изменения');
+      if (!currentImage.excluded && !await save()) throw new Error('Сначала сохраните изменения');
       const imageResponse = await fetch(runtimeDataset ? `/__boxscribe/image?id=${encodeURIComponent(currentImage.id)}` : `${base}/${currentImage.assetPath}`);
       if (!imageResponse.ok) throw new Error('Не удалось добавить кадр в ZIP');
       const stem = currentImage.name.replace(/\.[^.]+$/, '');
@@ -404,9 +410,9 @@
       {#if currentImage}<div class="top-image-caption"><Icon name="image" size={15}/><span>{currentImage.name}</span><span class="resolution"><i class="frame-edge left"></i><small>{currentImage.width} × {currentImage.height}</small><i class="frame-edge right"></i></span></div>{/if}
       <div class="top-actions">
         <span class:danger={saveError} class="save-state">{#if saveError}<Icon name="warning" size={14}/>{saveError}{:else if saving}<i class="spinner"></i>Сохранение…{:else if dirty}<i class="dirty-dot"></i>Не сохранено{:else}<Icon name="check" size={14}/>{savedAt ? `Сохранено · ${savedAt}` : 'Синхронизировано'}{/if}</span>
-        <button class="icon-btn" on:click={undo} title="Отменить (Ctrl+Z)"><Icon name="undo"/></button><button class="icon-btn" on:click={redo} title="Повторить (Ctrl+Y)"><Icon name="redo"/></button>
+        <button class="icon-btn" on:click={undo} disabled={Boolean(currentImage?.excluded)} title="Отменить (Ctrl+Z)"><Icon name="undo"/></button><button class="icon-btn" on:click={redo} disabled={Boolean(currentImage?.excluded)} title="Повторить (Ctrl+Y)"><Icon name="redo"/></button>
         <button class="icon-btn export-btn" on:click={downloadBundle} disabled={exporting} title="Скачать кадр и YOLO TXT в ZIP">{exporting ? 'ZIP…' : 'ZIP ↓'}</button>
-        <button class="save-btn" on:click={save}><Icon name="save"/>Сохранить <kbd>S</kbd></button>
+        <button class="save-btn" on:click={save} disabled={Boolean(currentImage?.excluded)}><Icon name="save"/>Сохранить <kbd>S</kbd></button>
       </div>
     </header>
     <aside class="sidebar">

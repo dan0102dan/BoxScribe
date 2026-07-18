@@ -29,6 +29,7 @@ export interface ProjectState {
   totalImages?: number;
   annotatedCount?: number;
   activeImages?: number;
+  excludedCount?: number;
 }
 
 export interface Viewport {

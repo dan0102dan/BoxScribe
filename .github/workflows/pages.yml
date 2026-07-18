@@ -26,6 +26,8 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run check
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
       - name: Build static demo
         env:
           BOXSCRIBE_DATASET_DIR: ${{ github.workspace }}/demo-dataset

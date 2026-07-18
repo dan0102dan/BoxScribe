@@ -6,7 +6,7 @@ import type { Plugin } from 'vite';
 import { imageSize } from 'image-size';
 import YAML from 'yaml';
 
-type RecordItem = { relative: string; splitIndex: number; index: number; annotated: boolean; excluded?: boolean; sourceOverride?: string; labelOverride?: string; boxCount?: number; classIds?: number[] };
+type RecordItem = { relative: string; splitIndex: number; index: number; annotated: boolean; excluded?: boolean; sourceOverride?: string; labelOverride?: string; restoreLabel?: string; boxCount?: number; classIds?: number[] };
 type DatasetIndex = { root: string; classes: string[]; splitDirs: string[]; records: RecordItem[]; excludedRecords: RecordItem[]; annotatedCount: number };
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
 const contentTypes: Record<string, string> = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.bmp': 'image/bmp' };
@@ -52,14 +52,21 @@ function pairedLabelsDir(splitDir: string) {
   return parts.join(path.sep);
 }
 
-function excludedPaths(index: DatasetIndex, record: RecordItem) {
-  const parsed = path.parse(record.relative);
+function excludedImagePath(index: DatasetIndex, record: RecordItem) {
   const root = path.join(index.root, '.boxscribe', 'excluded', splitName(index, record.splitIndex));
-  if (usesSeparateLabels(index.splitDirs[record.splitIndex])) return {
-    image: path.join(root, 'images', record.relative),
-    label: path.join(root, 'labels', parsed.dir, `${parsed.name}.txt`)
-  };
-  return { image: path.join(root, record.relative), label: path.join(root, parsed.dir, `${parsed.name}.txt`) };
+  return path.join(usesSeparateLabels(index.splitDirs[record.splitIndex]) ? path.join(root, 'images') : root, record.relative);
+}
+
+function labelLocations(index: DatasetIndex, record: RecordItem) {
+  const parsed = path.parse(record.relative);
+  const splitDir = index.splitDirs[record.splitIndex];
+  const excludedRoot = path.join(index.root, '.boxscribe', 'excluded', splitName(index, record.splitIndex));
+  const adjacent = path.join(splitDir, parsed.dir, `${parsed.name}.txt`);
+  if (!usesSeparateLabels(splitDir)) return [{ active: adjacent, excluded: path.join(excludedRoot, parsed.dir, `${parsed.name}.txt`) }];
+  return [
+    { active: adjacent, excluded: path.join(excludedRoot, 'images', parsed.dir, `${parsed.name}.txt`) },
+    { active: path.join(pairedLabelsDir(splitDir), parsed.dir, `${parsed.name}.txt`), excluded: path.join(excludedRoot, 'labels', parsed.dir, `${parsed.name}.txt`) }
+  ];
 }
 
 async function buildIndex(): Promise<DatasetIndex> {
@@ -76,7 +83,9 @@ async function buildIndex(): Promise<DatasetIndex> {
   for (let splitIndex = 0; splitIndex < splitDirs.length; splitIndex++) {
     const splitDir = splitDirs[splitIndex];
     const scanned = await scanDirectory(splitDir);
-    const labels = usesSeparateLabels(splitDir) ? (await scanDirectory(pairedLabelsDir(splitDir))).labels : scanned.labels;
+    const labels = usesSeparateLabels(splitDir)
+      ? new Set([...(await scanDirectory(pairedLabelsDir(splitDir))).labels, ...scanned.labels])
+      : scanned.labels;
     for (const relative of scanned.images) {
       const stem = relative.slice(0, -path.extname(relative).length);
       records.push({ relative, splitIndex, index: records.length, annotated: labels.has(stem) });
@@ -85,14 +94,16 @@ async function buildIndex(): Promise<DatasetIndex> {
   const shell: DatasetIndex = { root, classes, splitDirs, records, excludedRecords: [], annotatedCount: records.filter((record) => record.annotated).length };
   for (let splitIndex = 0; splitIndex < splitDirs.length; splitIndex++) {
     const excludedSplit = path.join(root, '.boxscribe', 'excluded', splitName(shell, splitIndex));
-    const separate = usesSeparateLabels(splitDirs[splitIndex]);
-    const imageRoot = separate ? path.join(excludedSplit, 'images') : excludedSplit;
-    const labelRoot = separate ? path.join(excludedSplit, 'labels') : excludedSplit;
+    const imageRoot = usesSeparateLabels(splitDirs[splitIndex]) ? path.join(excludedSplit, 'images') : excludedSplit;
     const scanned = await scanDirectory(imageRoot);
-    const labels = separate ? (await scanDirectory(labelRoot)).labels : scanned.labels;
     for (const relative of scanned.images) {
-      const parsed = path.parse(relative), label = path.join(labelRoot, parsed.dir, `${parsed.name}.txt`);
-      shell.excludedRecords.push({ relative, splitIndex, index: shell.excludedRecords.length, annotated: labels.has(path.join(parsed.dir, parsed.name)), excluded: true, sourceOverride: path.join(imageRoot, relative), labelOverride: label });
+      const record: RecordItem = { relative, splitIndex, index: shell.excludedRecords.length, annotated: false, excluded: true, sourceOverride: path.join(imageRoot, relative) };
+      const locations = labelLocations(shell, record);
+      const location = await firstExisting(locations, ({ excluded }) => excluded);
+      record.annotated = Boolean(location);
+      record.labelOverride = location?.excluded ?? locations.at(-1)!.excluded;
+      record.restoreLabel = location?.active ?? locations.at(-1)!.active;
+      shell.excludedRecords.push(record);
     }
   }
   return shell;
@@ -104,25 +115,22 @@ function sourcePath(index: DatasetIndex, record: RecordItem) {
 
 function labelCandidates(index: DatasetIndex, record: RecordItem) {
   if (record.excluded) return record.labelOverride ? [record.labelOverride] : [];
-  const parsed = path.parse(record.relative);
-  const splitDir = index.splitDirs[record.splitIndex];
-  const adjacent = path.join(splitDir, parsed.dir, `${parsed.name}.txt`);
-  const parts = splitDir.split(path.sep);
-  const imagesIndex = parts.lastIndexOf('images');
-  if (imagesIndex < 0) return [adjacent];
-  return [adjacent, path.join(pairedLabelsDir(splitDir), parsed.dir, `${parsed.name}.txt`)];
+  return labelLocations(index, record).map(({ active }) => active);
 }
 
 async function labelPath(index: DatasetIndex, record: RecordItem) {
-  for (const candidate of labelCandidates(index, record)) {
-    try { await open(candidate, 'r').then((handle) => handle.close()); return candidate; } catch { /* try next */ }
-  }
-  return labelCandidates(index, record).at(-1)!;
+  const candidates = labelCandidates(index, record);
+  return await firstExisting(candidates, (candidate) => candidate) ?? candidates.at(-1)!;
 }
 
 async function pathExists(target: string | undefined) {
   if (!target) return false;
   try { await open(target, 'r').then((handle) => handle.close()); return true; } catch { return false; }
+}
+
+async function firstExisting<T>(values: T[], pathFor: (value: T) => string) {
+  for (const value of values) if (await pathExists(pathFor(value))) return value;
+  return undefined;
 }
 
 async function moveFile(source: string, target: string) {
@@ -141,18 +149,20 @@ function sortRecords(records: RecordItem[]) { records.sort((a, b) => a.splitInde
 
 async function excludeRecord(index: DatasetIndex, record: RecordItem) {
   await hydrateLabel(index, record);
-  const source = sourcePath(index, record), label = await labelPath(index, record), hasLabel = await pathExists(label);
-  const target = excludedPaths(index, record);
+  const source = sourcePath(index, record), locations = labelLocations(index, record);
+  const labelLocation = await firstExisting(locations, ({ active }) => active);
+  const targetImage = excludedImagePath(index, record);
   const moved: Array<[string, string]> = [];
   try {
-    await moveFile(source, target.image); moved.push([source, target.image]);
-    if (hasLabel) { await moveFile(label, target.label); moved.push([label, target.label]); }
+    await moveFile(source, targetImage); moved.push([source, targetImage]);
+    if (labelLocation) { await moveFile(labelLocation.active, labelLocation.excluded); moved.push([labelLocation.active, labelLocation.excluded]); }
   } catch (error) {
     for (const [original, excluded] of moved.reverse()) try { await moveFile(excluded, original); } catch { /* preserve original error */ }
     throw error;
   }
   index.records.splice(record.index, 1); reindex(index.records);
-  const excluded: RecordItem = { ...record, index: index.excludedRecords.length, excluded: true, sourceOverride: target.image, labelOverride: target.label, annotated: hasLabel };
+  const fallbackLocation = locations.at(-1)!;
+  const excluded: RecordItem = { ...record, index: index.excludedRecords.length, excluded: true, sourceOverride: targetImage, labelOverride: labelLocation?.excluded ?? fallbackLocation.excluded, restoreLabel: labelLocation?.active ?? fallbackLocation.active, annotated: Boolean(labelLocation) };
   index.excludedRecords.push(excluded); sortRecords(index.excludedRecords);
   if (record.annotated) index.annotatedCount = Math.max(0, index.annotatedCount - 1);
   return excluded;
@@ -160,9 +170,9 @@ async function excludeRecord(index: DatasetIndex, record: RecordItem) {
 
 async function restoreRecord(index: DatasetIndex, record: RecordItem) {
   const source = sourcePath(index, record), hasLabel = await pathExists(record.labelOverride);
-  const active: RecordItem = { ...record, excluded: false, sourceOverride: undefined, labelOverride: undefined, annotated: hasLabel };
+  const active: RecordItem = { ...record, excluded: false, sourceOverride: undefined, labelOverride: undefined, restoreLabel: undefined, annotated: hasLabel };
   const targetImage = path.join(index.splitDirs[record.splitIndex], record.relative);
-  const targetLabel = labelCandidates(index, active).at(-1)!;
+  const targetLabel = record.restoreLabel ?? labelCandidates(index, active).at(-1)!;
   const moved: Array<[string, string]> = [];
   try {
     await moveFile(source, targetImage); moved.push([source, targetImage]);
@@ -218,14 +228,18 @@ function serializeYolo(boxes: any[], width: number, height: number) {
 }
 
 function item(record: RecordItem) {
-  const id = record.excluded ? `x:${record.splitIndex}:${encodeURIComponent(record.relative)}` : String(record.index);
+  const id = `r:${record.splitIndex}:${encodeURIComponent(record.relative)}`;
   return { id, name: path.basename(record.relative), width: 0, height: 0, annotated: record.annotated, excluded: Boolean(record.excluded), empty: record.annotated && record.boxCount === 0, boxCount: record.boxCount ?? -1, assetPath: '', index: record.index };
 }
 
 function findRecord(index: DatasetIndex, id: string) {
-  if (id.startsWith('x:')) return index.excludedRecords.find((record) => item(record).id === id);
-  const numeric = Number(id);
-  return Number.isInteger(numeric) && String(numeric) === id ? index.records[numeric] : undefined;
+  return [...index.records, ...index.excludedRecords].find((record) => item(record).id === id);
+}
+
+async function scopedRecords(index: DatasetIndex, status: string, query: string, requiredClassIds: number[]) {
+  const records = status === 'excluded' ? index.excludedRecords : index.records;
+  if (requiredClassIds.length) await hydrateLabels(index, records);
+  return records.filter((record) => (!query || record.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => record.classIds?.includes(classId)));
 }
 
 function sendJson(res: ServerResponse, value: unknown, status = 200) {
@@ -257,8 +271,7 @@ export function datasetDevPlugin(): Plugin {
             const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
             const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
             const records = status === 'excluded' ? index.excludedRecords : index.records;
-            if (requiredClassIds.length) await hydrateLabels(index, records);
-            const source = records.filter((record) => (!query || record.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => record.classIds?.includes(classId)));
+            const source = await scopedRecords(index, status, query, requiredClassIds);
             const page = source.slice(offset, offset + limit);
             await hydrateLabels(index, page);
             const first = source[0];
@@ -274,9 +287,7 @@ export function datasetDevPlugin(): Plugin {
             const query = (url.searchParams.get('query') || '').toLowerCase();
             const status = url.searchParams.get('status') || 'active';
             const requiredClassIds = (url.searchParams.get('classIds') || '').split(',').filter(Boolean).map(Number).filter(Number.isInteger);
-            const records = status === 'excluded' ? index.excludedRecords : index.records;
-            if (requiredClassIds.length) await hydrateLabels(index, records);
-            const source = records.filter((candidate) => (!query || candidate.relative.toLowerCase().includes(query)) && requiredClassIds.every((classId) => candidate.classIds?.includes(classId)));
+            const source = await scopedRecords(index, status, query, requiredClassIds);
             const position = source.findIndex((candidate) => item(candidate).id === currentId);
             const neighbor = position >= 0 ? source[position + direction] : undefined;
             if (!neighbor) return sendJson(res, { message: 'Соседний кадр не найден' }, 404);
@@ -290,13 +301,16 @@ export function datasetDevPlugin(): Plugin {
             const payload = await body(req);
             const excluded = payload.excluded !== false;
             const viewedRecord = typeof payload.currentId === 'string' ? findRecord(index, payload.currentId) : undefined;
-            const previousIndex = record.index;
+            const status = payload.status === 'excluded' ? 'excluded' : 'active';
+            const query = typeof payload.query === 'string' ? payload.query.toLowerCase() : '';
+            const requiredClassIds = Array.isArray(payload.classIds) ? payload.classIds.map(Number).filter(Number.isInteger) : [];
+            const before = await scopedRecords(index, status, query, requiredClassIds);
+            const previousIndex = Math.max(0, before.indexOf(record));
             const changed = excluded && !record.excluded ? await excludeRecord(index, record) : !excluded && record.excluded ? await restoreRecord(index, record) : record;
+            const after = await scopedRecords(index, status, query, requiredClassIds);
             const nextRecord = viewedRecord && viewedRecord !== record
               ? viewedRecord
-              : excluded
-                ? index.records[Math.min(previousIndex, index.records.length - 1)]
-                : index.excludedRecords[Math.min(previousIndex, index.excludedRecords.length - 1)];
+              : after[Math.min(previousIndex, after.length - 1)];
             return sendJson(res, { ok: true, image: item(changed), nextImage: nextRecord ? item(nextRecord) : null, activeImages: index.records.length, annotatedCount: index.annotatedCount, excludedCount: index.excludedRecords.length });
           }
           if (url.pathname === '/__boxscribe/image') {
@@ -315,9 +329,11 @@ export function datasetDevPlugin(): Plugin {
             const payload = await body(req), size = await dimensions(sourcePath(index, record)), target = await labelPath(index, record);
             await mkdir(path.dirname(target), { recursive: true });
             const text = serializeYolo(Array.isArray(payload.boxes) ? payload.boxes : [], size.width, size.height);
+            const wasAnnotated = record.annotated;
             await writeFile(target, text ? `${text}\n` : '', 'utf8'); record.annotated = true;
             record.boxCount = Array.isArray(payload.boxes) ? payload.boxes.length : 0;
             record.classIds = [...new Set<number>((Array.isArray(payload.boxes) ? payload.boxes : []).map((box: any) => Number(box.classId)))];
+            if (!wasAnnotated) index.annotatedCount++;
             return sendJson(res, { ok: true, savedAt: new Date().toISOString() });
           }
           return sendJson(res, { message: 'Маршрут не найден' }, 404);
