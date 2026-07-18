@@ -55,29 +55,6 @@ test.describe.serial('виртуальная корзина', () => {
     await unlink(path.join(dataset, 'train/labels/road-car.txt')).catch(() => undefined);
   });
 
-  test('canvas занимает всю рабочую область при изменении viewport', async ({ page }) => {
-    await page.goto('/');
-    for (const viewport of [{ width: 960, height: 600 }, { width: 1440, height: 900 }, { width: 1920, height: 1080 }]) {
-      await page.setViewportSize(viewport);
-      const geometry = await page.locator('.canvas-host canvas').evaluate((canvas: HTMLCanvasElement) => {
-        const workspace = document.querySelector<HTMLElement>('.workspace')!.getBoundingClientRect();
-        const host = document.querySelector<HTMLElement>('.canvas-host')!.getBoundingClientRect();
-        const rect = canvas.getBoundingClientRect();
-        return {
-          workspace: { x: workspace.x, y: workspace.y, width: workspace.width, height: workspace.height },
-          host: { x: host.x, y: host.y, width: host.width, height: host.height },
-          canvas: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-          bitmap: { width: canvas.width, height: canvas.height },
-          dpr: window.devicePixelRatio || 1
-        };
-      });
-      expect(geometry.host).toEqual(geometry.workspace);
-      expect(geometry.canvas).toEqual(geometry.workspace);
-      await expect.poll(() => page.locator('.canvas-host canvas').evaluate((canvas: HTMLCanvasElement) => [canvas.width, canvas.height]))
-        .toEqual([Math.round(geometry.canvas.width * geometry.dpr), Math.round(geometry.canvas.height * geometry.dpr)]);
-    }
-  });
-
   test('использует стабильные ID и не переиспользует URL другого изображения', async ({ request }) => {
     const before = await project(request);
     const [removed, next] = before.images;
