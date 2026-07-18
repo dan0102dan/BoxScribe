@@ -1,5 +1,5 @@
 <script lang="ts">
-  export let name: 'logo' | 'folder' | 'save' | 'undo' | 'redo' | 'fit' | 'eye' | 'trash' | 'chevron' | 'search' | 'image' | 'check' | 'warning';
+  export let name: 'logo' | 'folder' | 'save' | 'undo' | 'redo' | 'fit' | 'focus' | 'eye' | 'trash' | 'chevron' | 'search' | 'image' | 'check' | 'warning';
   export let size = 18;
 </script>
 
@@ -10,6 +10,7 @@
   {:else if name === 'undo'}<path d="M9 7 4 12l5 5"/><path d="M5 12h8a6 6 0 0 1 6 6"/>
   {:else if name === 'redo'}<path d="m15 7 5 5-5 5"/><path d="M19 12h-8a6 6 0 0 0-6 6"/>
   {:else if name === 'fit'}<path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/>
+  {:else if name === 'focus'}<path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/><rect x="8" y="8" width="8" height="8" rx="1"/>
   {:else if name === 'eye'}<path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/>
   {:else if name === 'trash'}<path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6"/>
   {:else if name === 'chevron'}<path d="m9 18 6-6-6-6"/>

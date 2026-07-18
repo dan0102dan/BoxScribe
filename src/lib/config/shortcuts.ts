@@ -3,6 +3,7 @@ export const shortcuts = {
   next: ['d', 'ArrowRight'],
   save: ['s'],
   fit: ['f'],
+  focus: ['b'],
   undo: ['z'],
   redo: ['y'],
   previousClass: ['['],

@@ -1,0 +1,31 @@
+name: Checks
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - name: Build static demo
+        env:
+          BOXSCRIBE_DATASET_DIR: ${{ github.workspace }}/demo-dataset
+          BASE_PATH: /${{ github.event.repository.name }}
+        run: npm run build

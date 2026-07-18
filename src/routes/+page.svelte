@@ -15,6 +15,7 @@
   let currentId: string | null = project?.lastImageId ?? project?.images[0]?.id ?? null;
   let boxes: BoundingBox[] = [];
   let selectedId: string | null = null;
+  let focusedId: string | null = null;
   let currentClass = 0;
   let dirty = false;
   let saving = false;
@@ -45,6 +46,7 @@
     return matchesSearch && matchesFilter && matchesClass;
   });
   $: selectedBox = boxes.find((box) => box.id === selectedId) ?? null;
+  $: selectedBoxNumber = selectedBox ? boxes.findIndex((box) => box.id === selectedBox.id) + 1 : 0;
   $: totalImages = project.totalImages ?? project.images.length;
   $: annotatedCount = project.annotatedCount ?? project.images.filter((image) => image.annotated).length;
   $: progress = totalImages ? Math.round(annotatedCount / totalImages * 100) : 0;
@@ -247,7 +249,7 @@
 
   function removeSelected() {
     if (!selectedId) return;
-    history.push(boxes); boxes = boxes.filter((box) => box.id !== selectedId); selectedId = null; markDirty();
+    history.push(boxes); boxes = boxes.filter((box) => box.id !== selectedId); selectedId = null; focusedId = null; markDirty();
   }
 
   function changeSelectedClass(classId: number) {
@@ -258,9 +260,30 @@
   }
 
   function selectBox(id: string | null) {
+    if (id !== selectedId) focusedId = null;
     selectedId = id;
     const box = boxes.find((item) => item.id === id);
     if (box) currentClass = box.classId;
+  }
+
+  async function focusCurrent() {
+    if (!selectedId) return;
+    focusedId = selectedId;
+    await tick();
+    canvas?.focusSelected();
+  }
+
+  async function browseBoxes(direction: 1 | -1, advance = false) {
+    if (!boxes.length) return;
+    const currentIndex = boxes.findIndex((box) => box.id === selectedId);
+    const startIndex = direction > 0 ? 0 : boxes.length - 1;
+    const targetIndex = currentIndex < 0
+      ? startIndex
+      : advance || focusedId === selectedId
+        ? (currentIndex + direction + boxes.length) % boxes.length
+        : currentIndex;
+    selectBox(boxes[targetIndex].id);
+    await focusCurrent();
   }
 
   function undo() { const previous = history.undo(boxes); if (previous) { boxes = previous; selectedId = null; markDirty(); } }
@@ -296,6 +319,7 @@
     else if (shortcuts.next.includes(key as never)) navigate(1);
     else if (shortcuts.save.includes(key as never)) { event.preventDefault(); save(); }
     else if (shortcuts.fit.includes(key as never)) canvas?.fit();
+    else if (shortcuts.focus.includes(key as never)) { event.preventDefault(); browseBoxes(event.shiftKey ? -1 : 1); }
     else if (key === 'Delete' || key === 'Backspace') removeSelected();
     else if (/^[1-9]$/.test(key)) changeSelectedClass(Number(key) - 1);
     else if (shortcuts.previousClass.includes(key as never)) changeSelectedClass((currentClass - 1 + (project?.classes.length ?? 1)) % (project?.classes.length ?? 1));
@@ -357,7 +381,7 @@
     <section class="workspace">
       {#if currentImage}
         <AnnotationCanvas bind:this={canvas} imageUrl={frameUrl(currentImage)} imageInfo={currentImage} {boxes} {selectedId} {currentClass} classes={project.classes} {showLabels} on:change={(e) => updateBoxes(e.detail)} on:commit={commit} on:select={(e) => selectBox(e.detail)} on:viewport={(e) => zoom = e.detail}/>
-        <div class="canvas-tools"><button on:click={() => canvas.fit()} title="Вписать (F)"><Icon name="fit"/></button><button class:active={showLabels} on:click={() => showLabels = !showLabels} title="Подписи"><Icon name="eye"/></button><span>{zoom}%</span></div>
+        <div class="canvas-tools"><button on:click={() => canvas.fit()} title="Показать весь кадр (F)"><Icon name="fit"/></button><button class:active={showLabels} on:click={() => showLabels = !showLabels} title="Подписи"><Icon name="eye"/></button><span>{zoom}%</span></div>
         <div class="nav-controls"><button on:click={() => navigate(-1)} disabled={(currentImage.index ?? 0) === 0}><span class="arrow">←</span><kbd>A</kbd></button><span class="counter"><input type="text" inputmode="numeric" pattern="[0-9]*" value={(currentImage.index ?? project.images.findIndex((i) => i.id === currentId)) + 1} aria-label="Перейти к номеру кадра" on:focus={placeFrameCaretAtEnd} on:pointerdown={placeFrameCaretAtEnd} on:change={jumpToFrame} on:keydown={frameInputKey}/><small>/ {totalImages}</small></span><button on:click={() => navigate(1)} disabled={(currentImage.index ?? project.images.findIndex((i) => i.id === currentId)) >= totalImages - 1}><kbd>D</kbd><span class="arrow">→</span></button></div>
       {/if}
     </section>
@@ -371,8 +395,8 @@
         {#each boxes as box, index}<button class:active={box.id === selectedId} on:click={() => selectBox(box.id)}><i style={`--class-color:var(--c${box.classId % 9})`}></i><span><b>{project.classes[box.classId] ?? `Класс ${box.classId}`}</b><small>#{index + 1} · {Math.round(box.width)}×{Math.round(box.height)}</small></span></button>{/each}
         {#if !boxes.length}<div class="empty-boxes"><span>＋</span><b>Нарисуйте первый bbox</b><small>Протяните мышью по объекту</small></div>{/if}
       </div>
-      {#if selectedBox}<div class="selection-card"><div><span>Выбранный объект</span><button on:click={removeSelected} title="Удалить"><Icon name="trash" size={16}/></button></div><label><span>Класс</span><select value={selectedBox.classId} on:change={(event) => changeSelectedClass(Number(event.currentTarget.value))}>{#each project.classes as className, index}<option value={index}>{className}</option>{/each}</select></label><code>x {Math.round(selectedBox.x)} · y {Math.round(selectedBox.y)}<br/>w {Math.round(selectedBox.width)} · h {Math.round(selectedBox.height)}</code></div>{/if}
-      <div class="hints"><span><kbd>Space</kbd> Перемещение</span><span><kbd>Scroll</kbd> Масштаб</span><span><kbd>Del</kbd> Удалить</span><span><kbd>F</kbd> Вписать</span></div>
+      {#if selectedBox}<div class="selection-card"><div><span>Объект <b>{selectedBoxNumber} / {boxes.length}</b></span><span class="selection-actions"><button class="box-previous" on:click={() => browseBoxes(-1, true)} title="Предыдущий объект (Shift+B)"><Icon name="chevron" size={15}/></button><button class="focus-selected" on:click={focusCurrent} title="Приблизить выбранный bbox (B)"><Icon name="focus" size={16}/></button><button on:click={() => browseBoxes(1, true)} title="Следующий объект (B)"><Icon name="chevron" size={15}/></button><button class="remove-selected" on:click={removeSelected} title="Удалить"><Icon name="trash" size={16}/></button></span></div><label><span>Класс</span><select value={selectedBox.classId} on:change={(event) => changeSelectedClass(Number(event.currentTarget.value))}>{#each project.classes as className, index}<option value={index}>{className}</option>{/each}</select></label><code>x {Math.round(selectedBox.x)} · y {Math.round(selectedBox.y)}<br/>w {Math.round(selectedBox.width)} · h {Math.round(selectedBox.height)}</code></div>{/if}
+      <div class="hints"><span><kbd>Space</kbd> Перемещение</span><span><kbd>Scroll</kbd> Масштаб</span><span><kbd>Del</kbd> Удалить</span><span><kbd>F</kbd> Весь кадр</span></div>
     </aside>
 </main>
 
@@ -383,6 +407,9 @@
   .class-list button{position:relative;height:44px;padding-left:13px;border:0;border-radius:8px;transition:background-color .14s ease}.class-list button:hover{border:0;background:#20252b}.class-list button.active{border:0;background:color-mix(in srgb,var(--class-color) 7%,#20252b);box-shadow:none}.class-list button.active::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:4px;border-radius:999px;background:var(--class-color);box-shadow:0 0 7px color-mix(in srgb,var(--class-color) 28%,transparent)}
   .top-image-caption .resolution{height:20px;margin-left:1px;padding:0;gap:5px;border:0;background:transparent}.top-image-caption .resolution small{color:#7f8790;font-size:9px;font-weight:600;letter-spacing:0}.resolution .frame-edge{position:relative;width:5px;height:13px;flex:none;opacity:.9}.resolution .frame-edge::before,.resolution .frame-edge::after{content:"";position:absolute;left:0;width:5px;height:4px}.resolution .frame-edge.left::before{top:0;border-top:1px solid #737b84;border-left:1px solid #737b84}.resolution .frame-edge.left::after{bottom:0;border-bottom:1px solid #737b84;border-left:1px solid #737b84}.resolution .frame-edge.right::before{top:0;border-top:1px solid #737b84;border-right:1px solid #737b84}.resolution .frame-edge.right::after{bottom:0;border-bottom:1px solid #737b84;border-right:1px solid #737b84}
   .class-filters{display:flex;align-items:center;gap:4px;padding:0 12px 9px;overflow-x:auto;scrollbar-width:none}.class-filters::-webkit-scrollbar{display:none}.class-filters button{height:25px;padding:0 8px;border:1px solid #30363d;border-radius:6px;background:transparent;color:#7e858d;display:flex;align-items:center;gap:5px;font-size:9px;white-space:nowrap;cursor:pointer}.class-filters button i{width:6px;height:6px;border-radius:2px;background:var(--filter-color)}.class-filters button:hover{color:#c6cbd0;background:#1d2127}.class-filters button.active{border-color:color-mix(in srgb,var(--filter-color,#e9ff70) 55%,#30363d);background:color-mix(in srgb,var(--filter-color,#e9ff70) 8%,#1d2127);color:#e5e8ea}.class-filters button:disabled{opacity:.45;cursor:wait}
+  .selection-card>div>span:first-child{display:flex;align-items:center;gap:5px}.selection-card>div>span:first-child b{color:#aeb5bc;font:650 9px ui-monospace;letter-spacing:0}.selection-actions{display:flex;align-items:center;gap:2px}.selection-actions button{width:24px;height:25px;display:grid;place-items:center;border-radius:5px}.selection-actions .box-previous :global(svg){transform:rotate(180deg)}.selection-actions .focus-selected:hover,.selection-actions button:not(.remove-selected):hover{color:#e9ff70;background:#e9ff7010}.selection-actions .remove-selected{margin-left:2px}.selection-actions .remove-selected:hover{background:#ff8d7210}
+  .selection-actions button{padding:0;line-height:0}.selection-actions button :global(svg){display:block;margin:auto}
+  .workspace{overflow:hidden;isolation:isolate}.canvas-tools,.nav-controls{z-index:2}
   .filter-block{padding:9px 12px 10px;border-top:1px solid #252a30;border-bottom:1px solid #252a30;background:#15191e}.filter-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}.filter-title>span,.status-filter>span,.status-locked>span{color:#666e76;font:650 8px ui-monospace;text-transform:uppercase;letter-spacing:.12em}.filter-title>small{color:#50575f;font:600 8px ui-monospace}.object-filter .class-filters{padding:0;gap:5px}.status-filter{padding:8px 12px 10px;display:grid;grid-template-columns:45px 1fr;align-items:center;gap:5px}.status-filter .filters{padding:0;gap:2px}.status-filter .filters button{padding:5px 6px}.status-locked{height:39px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #252a30}.status-locked>b{display:flex;align-items:center;gap:6px;color:#8d959d;font-size:9px;font-weight:600}.status-locked>b i{width:6px;height:6px;border-radius:50%;background:#77e6a1;box-shadow:0 0 0 3px #77e6a112}
   @media(max-width:1100px){.app-shell{--side:220px;--inspect:220px}}
 </style>
