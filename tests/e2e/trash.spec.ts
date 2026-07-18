@@ -1,6 +1,7 @@
 import { expect, test, type APIRequestContext } from '@playwright/test';
 import { spawn } from 'node:child_process';
 import { access, readFile, unlink } from 'node:fs/promises';
+import { createServer, type AddressInfo } from 'node:net';
 import path from 'node:path';
 
 const dataset = path.resolve('demo-dataset');
@@ -27,7 +28,23 @@ async function restoreEverything(request: APIRequestContext) {
   for (const image of (await project(request, 'excluded')).images) await setExcluded(request, image, false);
 }
 
+function freePort() {
+  return new Promise<number>((resolve, reject) => {
+    const probe = createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address() as AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
 test.describe.serial('виртуальная корзина', () => {
+  test.beforeAll(async () => {
+    // A crashed previous run may have left this label behind; drop it before the
+    // first request builds the server's in-memory index.
+    await unlink(path.join(dataset, 'train/labels/road-car.txt')).catch(() => undefined);
+  });
   test.beforeEach(async ({ request }) => restoreEverything(request));
   test.afterAll(async ({ request }) => {
     try { await restoreEverything(request); } catch { /* another server may have completed the final restore */ }
@@ -129,11 +146,15 @@ test.describe.serial('виртуальная корзина', () => {
     await expect(page.locator('.image-row').filter({ hasText: 'demo-fox.png' })).toHaveCount(0);
   });
 
+  // Этот тест должен оставаться последним в serial-наборе: восстановление выполняет
+  // второй сервер, поэтому in-memory индекс основного сервера после него устаревает
+  // (afterAll это учитывает).
   test('восстанавливает исходный adjacent TXT после перезапуска сервера', async ({ request }) => {
     const image = (await project(request)).images.find((item) => item.name === 'demo-bird.png')!;
     await setExcluded(request, image, true);
 
-    const server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', '4174', '--strictPort'], {
+    const port = await freePort();
+    const server = spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', String(port), '--strictPort'], {
       cwd: path.resolve('.'),
       env: { ...process.env, BOXSCRIBE_DATASET_DIR: dataset },
       stdio: 'ignore'
@@ -141,13 +162,13 @@ test.describe.serial('виртуальная корзина', () => {
     try {
       let ready = false;
       for (let attempt = 0; attempt < 50 && !ready; attempt++) {
-        try { ready = (await fetch('http://127.0.0.1:4174/__boxscribe/project?status=excluded')).ok; }
+        try { ready = (await fetch(`http://127.0.0.1:${port}/__boxscribe/project?status=excluded`)).ok; }
         catch { await new Promise((resolve) => setTimeout(resolve, 100)); }
       }
       expect(ready).toBeTruthy();
-      const trash = await fetch('http://127.0.0.1:4174/__boxscribe/project?status=excluded').then((response) => response.json()) as Project;
+      const trash = await fetch(`http://127.0.0.1:${port}/__boxscribe/project?status=excluded`).then((response) => response.json()) as Project;
       const restartedRecord = trash.images.find((item) => item.name === image.name)!;
-      const response = await fetch(`http://127.0.0.1:4174/__boxscribe/exclude?id=${encodeURIComponent(restartedRecord.id)}`, {
+      const response = await fetch(`http://127.0.0.1:${port}/__boxscribe/exclude?id=${encodeURIComponent(restartedRecord.id)}`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ excluded: false, currentId: restartedRecord.id, status: 'excluded' })

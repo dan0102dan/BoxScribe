@@ -7,7 +7,7 @@ import { imageSize } from 'image-size';
 import YAML from 'yaml';
 
 type RecordItem = { relative: string; splitIndex: number; index: number; annotated: boolean; excluded?: boolean; sourceOverride?: string; labelOverride?: string; restoreLabel?: string; boxCount?: number; classIds?: number[] };
-type DatasetIndex = { root: string; classes: string[]; splitDirs: string[]; records: RecordItem[]; excludedRecords: RecordItem[]; annotatedCount: number };
+type DatasetIndex = { root: string; base: string; classes: string[]; splitDirs: string[]; records: RecordItem[]; excludedRecords: RecordItem[]; annotatedCount: number };
 const imageExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
 const contentTypes: Record<string, string> = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.bmp': 'image/bmp' };
 
@@ -40,21 +40,25 @@ function splitName(index: Pick<DatasetIndex, 'splitDirs'>, splitIndex: number) {
   return name === 'images' ? path.basename(path.dirname(splitDir)) : name || `split-${splitIndex}`;
 }
 
-function usesSeparateLabels(splitDir: string) {
-  return splitDir.split(path.sep).lastIndexOf('images') >= 0;
+function splitSegments(base: string, splitDir: string) {
+  return path.relative(base, splitDir).split(path.sep);
 }
 
-function pairedLabelsDir(splitDir: string) {
-  const parts = splitDir.split(path.sep);
-  const imagesIndex = parts.lastIndexOf('images');
+function usesSeparateLabels(base: string, splitDir: string) {
+  return splitSegments(base, splitDir).lastIndexOf('images') >= 0;
+}
+
+function pairedLabelsDir(base: string, splitDir: string) {
+  const segments = splitSegments(base, splitDir);
+  const imagesIndex = segments.lastIndexOf('images');
   if (imagesIndex < 0) return splitDir;
-  parts[imagesIndex] = 'labels';
-  return parts.join(path.sep);
+  segments[imagesIndex] = 'labels';
+  return path.join(base, ...segments);
 }
 
 function excludedImagePath(index: DatasetIndex, record: RecordItem) {
   const root = path.join(index.root, '.boxscribe', 'excluded', splitName(index, record.splitIndex));
-  return path.join(usesSeparateLabels(index.splitDirs[record.splitIndex]) ? path.join(root, 'images') : root, record.relative);
+  return path.join(usesSeparateLabels(index.base, index.splitDirs[record.splitIndex]) ? path.join(root, 'images') : root, record.relative);
 }
 
 function labelLocations(index: DatasetIndex, record: RecordItem) {
@@ -62,10 +66,10 @@ function labelLocations(index: DatasetIndex, record: RecordItem) {
   const splitDir = index.splitDirs[record.splitIndex];
   const excludedRoot = path.join(index.root, '.boxscribe', 'excluded', splitName(index, record.splitIndex));
   const adjacent = path.join(splitDir, parsed.dir, `${parsed.name}.txt`);
-  if (!usesSeparateLabels(splitDir)) return [{ active: adjacent, excluded: path.join(excludedRoot, parsed.dir, `${parsed.name}.txt`) }];
+  if (!usesSeparateLabels(index.base, splitDir)) return [{ active: adjacent, excluded: path.join(excludedRoot, parsed.dir, `${parsed.name}.txt`) }];
   return [
     { active: adjacent, excluded: path.join(excludedRoot, 'images', parsed.dir, `${parsed.name}.txt`) },
-    { active: path.join(pairedLabelsDir(splitDir), parsed.dir, `${parsed.name}.txt`), excluded: path.join(excludedRoot, 'labels', parsed.dir, `${parsed.name}.txt`) }
+    { active: path.join(pairedLabelsDir(index.base, splitDir), parsed.dir, `${parsed.name}.txt`), excluded: path.join(excludedRoot, 'labels', parsed.dir, `${parsed.name}.txt`) }
   ];
 }
 
@@ -83,18 +87,18 @@ async function buildIndex(): Promise<DatasetIndex> {
   for (let splitIndex = 0; splitIndex < splitDirs.length; splitIndex++) {
     const splitDir = splitDirs[splitIndex];
     const scanned = await scanDirectory(splitDir);
-    const labels = usesSeparateLabels(splitDir)
-      ? new Set([...(await scanDirectory(pairedLabelsDir(splitDir))).labels, ...scanned.labels])
+    const labels = usesSeparateLabels(configuredBase, splitDir)
+      ? new Set([...(await scanDirectory(pairedLabelsDir(configuredBase, splitDir))).labels, ...scanned.labels])
       : scanned.labels;
     for (const relative of scanned.images) {
       const stem = relative.slice(0, -path.extname(relative).length);
       records.push({ relative, splitIndex, index: records.length, annotated: labels.has(stem) });
     }
   }
-  const shell: DatasetIndex = { root, classes, splitDirs, records, excludedRecords: [], annotatedCount: records.filter((record) => record.annotated).length };
+  const shell: DatasetIndex = { root, base: configuredBase, classes, splitDirs, records, excludedRecords: [], annotatedCount: records.filter((record) => record.annotated).length };
   for (let splitIndex = 0; splitIndex < splitDirs.length; splitIndex++) {
     const excludedSplit = path.join(root, '.boxscribe', 'excluded', splitName(shell, splitIndex));
-    const imageRoot = usesSeparateLabels(splitDirs[splitIndex]) ? path.join(excludedSplit, 'images') : excludedSplit;
+    const imageRoot = usesSeparateLabels(configuredBase, splitDirs[splitIndex]) ? path.join(excludedSplit, 'images') : excludedSplit;
     const scanned = await scanDirectory(imageRoot);
     for (const relative of scanned.images) {
       const record: RecordItem = { relative, splitIndex, index: shell.excludedRecords.length, annotated: false, excluded: true, sourceOverride: path.join(imageRoot, relative) };
@@ -227,13 +231,16 @@ function serializeYolo(boxes: any[], width: number, height: number) {
     .map((value, index) => index ? Number(value).toFixed(6) : value).join(' ')).join('\n');
 }
 
+function recordId(record: RecordItem) {
+  return `r:${record.splitIndex}:${encodeURIComponent(record.relative)}`;
+}
+
 function item(record: RecordItem) {
-  const id = `r:${record.splitIndex}:${encodeURIComponent(record.relative)}`;
-  return { id, name: path.basename(record.relative), width: 0, height: 0, annotated: record.annotated, excluded: Boolean(record.excluded), empty: record.annotated && record.boxCount === 0, boxCount: record.boxCount ?? -1, assetPath: '', index: record.index };
+  return { id: recordId(record), name: path.basename(record.relative), width: 0, height: 0, annotated: record.annotated, excluded: Boolean(record.excluded), empty: record.annotated && record.boxCount === 0, boxCount: record.boxCount ?? -1, assetPath: '', index: record.index };
 }
 
 function findRecord(index: DatasetIndex, id: string) {
-  return [...index.records, ...index.excludedRecords].find((record) => item(record).id === id);
+  return index.records.find((record) => recordId(record) === id) ?? index.excludedRecords.find((record) => recordId(record) === id);
 }
 
 async function scopedRecords(index: DatasetIndex, status: string, query: string, requiredClassIds: number[]) {
@@ -275,7 +282,7 @@ export function datasetDevPlugin(): Plugin {
             const page = source.slice(offset, offset + limit);
             await hydrateLabels(index, page);
             const first = source[0];
-            return sendJson(res, { name: path.basename(index.root), imageDir: index.root, classes: index.classes, images: page.map(item), lastImageId: first ? item(first).id : null, totalImages: records.length, activeImages: index.records.length, annotatedCount: index.annotatedCount, resultCount: source.length, excludedCount: index.excludedRecords.length });
+            return sendJson(res, { name: path.basename(index.root), imageDir: index.root, classes: index.classes, images: page.map(item), lastImageId: first ? recordId(first) : null, totalImages: records.length, activeImages: index.records.length, annotatedCount: index.annotatedCount, resultCount: source.length, excludedCount: index.excludedRecords.length });
           }
           if (url.pathname === '/__boxscribe/item') {
             const record = index.records[Number(url.searchParams.get('index'))];
@@ -288,7 +295,7 @@ export function datasetDevPlugin(): Plugin {
             const status = url.searchParams.get('status') || 'active';
             const requiredClassIds = (url.searchParams.get('classIds') || '').split(',').filter(Boolean).map(Number).filter(Number.isInteger);
             const source = await scopedRecords(index, status, query, requiredClassIds);
-            const position = source.findIndex((candidate) => item(candidate).id === currentId);
+            const position = source.findIndex((candidate) => recordId(candidate) === currentId);
             const neighbor = position >= 0 ? source[position + direction] : undefined;
             if (!neighbor) return sendJson(res, { message: 'Соседний кадр не найден' }, 404);
             await hydrateLabel(index, neighbor);

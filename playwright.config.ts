@@ -10,7 +10,8 @@ export default defineConfig({
     trace: 'retain-on-failure'
   },
   webServer: {
-    command: 'BOXSCRIBE_DATASET_DIR=demo-dataset npm run dev -- --host 127.0.0.1 --port 4173',
+    command: 'npm run dev -- --host 127.0.0.1 --port 4173',
+    env: { BOXSCRIBE_DATASET_DIR: 'demo-dataset' },
     url: 'http://127.0.0.1:4173',
     reuseExistingServer: false,
     timeout: 120_000

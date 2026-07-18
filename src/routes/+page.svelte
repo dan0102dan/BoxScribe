@@ -265,7 +265,8 @@
     const requested = Number.parseInt(input.value, 10);
     const current = currentImage ? (currentImage.index ?? project.images.findIndex((image) => image.id === currentId)) + 1 : 1;
     if (!Number.isInteger(requested) || requested < 1 || requested > totalImages) { input.value = String(current); return; }
-    search = ''; filter = 'all';
+    search = '';
+    await setStatusFilter('all');
     await openIndex(requested - 1);
   }
 
@@ -424,7 +425,7 @@
       {#if classFilters.length}
         <div class="status-locked"><span>Статус</span><b><i></i>С разметкой</b></div>
       {:else}
-        <div class="status-filter"><span>Статус</span><div class="filters" on:wheel={scrollStatuses}><button class:active={filter === 'all'} on:click={() => setStatusFilter('all')}>Все</button><button class:active={filter === 'unannotated'} on:click={() => setStatusFilter('unannotated')}>Новые</button><button class:active={filter === 'annotated'} on:click={() => setStatusFilter('annotated')}>Готово</button><button class:active={filter === 'empty'} on:click={() => setStatusFilter('empty')}>Пустые</button><button class:active={filter === 'excluded'} on:click={() => setStatusFilter('excluded')}>Исключённые</button></div></div>
+        <div class="status-filter"><span>Статус</span><div class="filters" on:wheel={scrollStatuses}><button class:active={filter === 'all'} on:click={() => setStatusFilter('all')}>Все</button><button class:active={filter === 'unannotated'} on:click={() => setStatusFilter('unannotated')}>Новые</button><button class:active={filter === 'annotated'} on:click={() => setStatusFilter('annotated')}>Готово</button><button class:active={filter === 'empty'} on:click={() => setStatusFilter('empty')}>Пустые</button>{#if runtimeDataset}<button class:active={filter === 'excluded'} on:click={() => setStatusFilter('excluded')}>Исключённые</button>{/if}</div></div>
       {/if}
       <div class="image-list" bind:this={imageList}>
         {#each filteredImages as image, index}
