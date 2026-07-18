@@ -26,6 +26,7 @@
   let image = new Image();
   let loaded = false;
   let imageLoadSequence = 0;
+  let fittedDims = '';
   let viewport: Viewport = { scale: 1, offsetX: 0, offsetY: 0 };
   let spaceDown = false;
   let action: null | { type: 'pan' | 'create' | 'move' | 'resize'; startX: number; startY: number; before: BoundingBox[]; box?: BoundingBox; handle?: string; startViewport?: Viewport } = null;
@@ -33,6 +34,7 @@
 
   $: if (imageUrl) loadImage(imageUrl);
   $: if (ctx && loaded && boxes && selectedId !== undefined && showLabels !== undefined) draw();
+  $: if (loaded && host && imageInfo.width && `${imageInfo.width}x${imageInfo.height}` !== fittedDims) fit();
 
   function loadImage(url: string) {
     const request = ++imageLoadSequence;
@@ -53,8 +55,6 @@
     const rect = host.getBoundingClientRect();
     canvas.width = Math.round(rect.width * ratio);
     canvas.height = Math.round(rect.height * ratio);
-    canvas.style.width = `${rect.width}px`;
-    canvas.style.height = `${rect.height}px`;
     ctx = canvas.getContext('2d')!;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     if (loaded) fit(); else draw();
@@ -62,6 +62,7 @@
 
   export function fit() {
     if (!host || !loaded) return;
+    fittedDims = `${imageInfo.width}x${imageInfo.height}`;
     viewport = fitViewport(host.clientWidth, host.clientHeight, imageInfo.width, imageInfo.height);
     dispatch('viewport', Math.round(viewport.scale * 100));
     draw();
@@ -244,6 +245,6 @@
 </div>
 
 <style>
-  .canvas-host{position:absolute;inset:0;overflow:hidden;background:#111419;cursor:crosshair;touch-action:none}
+  .canvas-host{position:absolute;inset:0;width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;background:#111419;cursor:crosshair;touch-action:none}
   canvas{display:block;width:100%;height:100%}.space{cursor:grab}.grabbing{cursor:grabbing}
 </style>
