@@ -9,7 +9,7 @@ type DecodeStats = { bestScore: number };
 
 type LoadedSession = { session: import('onnxruntime-web').InferenceSession; backend: 'webgpu' | 'wasm' };
 const sessions = new Map<string, Promise<LoadedSession>>();
-const maxCachedSessions = 2;
+let maxCachedSessions = 3;
 
 function iou(a: Detection, b: Detection) {
   const left = Math.max(a.x, b.x), top = Math.max(a.y, b.y);
@@ -117,6 +117,11 @@ export async function releaseOnnxSession(url: string) {
 }
 
 export function isOnnxSessionCached(url: string) { return sessions.has(url); }
+
+export async function warmOnnxSessions(urls: string[]) {
+  maxCachedSessions = Math.max(maxCachedSessions, urls.length);
+  for (const url of urls) await loadSession(url);
+}
 
 export async function detectOnnx(modelUrl: string, imageUrl: string, classCount: number, confidence: number) {
   const startedAt = performance.now();
