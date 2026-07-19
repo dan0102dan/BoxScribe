@@ -366,6 +366,7 @@
     selectedId = id;
     const box = boxes.find((item) => item.id === id);
     if (box) currentClass = box.classId;
+    if (id) void tick().then(() => document.querySelector('.box-list button.active')?.scrollIntoView({ block: 'nearest' }));
   }
 
   async function focusCurrent() {
