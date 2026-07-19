@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "prepare": "svelte-kit sync",
     "prepare:dataset": "node scripts/prepare-dataset.mjs --copy",
     "predev": "node scripts/clean-dev.mjs",
     "dev": "vite dev",
