@@ -57,6 +57,38 @@ test.describe.serial('разметка и корзина (UI)', () => {
     expect((await downloadPromise).suggestedFilename()).toBe('road-car.zip');
   });
 
+  test('кадр без bbox активного класса скрывается из отфильтрованного списка', async ({ page }) => {
+    await page.goto('/');
+    await row(page, 'road-car.png').locator('.image-open').click();
+    await expect(caption(page)).toContainText('road-car.png');
+    await expect(page.locator('.frame-loading')).toHaveCount(0);
+
+    await page.locator('.class-list button').filter({ hasText: 'car' }).click();
+    const canvasBox = (await page.locator('canvas').boundingBox())!;
+    const cx = canvasBox.x + canvasBox.width / 2, cy = canvasBox.y + canvasBox.height / 2;
+    await page.mouse.move(cx - 60, cy - 60);
+    await page.mouse.down();
+    await page.mouse.move(cx + 60, cy + 60, { steps: 5 });
+    await page.mouse.up();
+    await page.getByRole('button', { name: /Сохранить/ }).click();
+    await expect(page.locator('.save-state')).toContainText('Сохранено');
+
+    await page.getByRole('button', { name: 'car', exact: true }).click();
+    await expect(row(page, 'road-car-truck.png')).toBeVisible();
+    await expect(row(page, 'road-car.png')).toBeVisible();
+
+    await row(page, 'road-car.png').locator('.image-open').click();
+    await expect(caption(page)).toContainText('road-car.png');
+    await expect(page.locator('.frame-loading')).toHaveCount(0);
+
+    await page.locator('.box-list button').click();
+    await page.locator('.selection-card select').selectOption('3');
+
+    await expect(row(page, 'road-car.png')).toHaveCount(0);
+    await expect(row(page, 'road-car-truck.png')).toBeVisible();
+    await expect(caption(page)).toContainText('road-car.png');
+  });
+
   test('в UI открывает корзину в read-only, экспортирует и восстанавливает кадр', async ({ page }) => {
     await page.goto('/');
     const foxRow = row(page, 'demo-fox.png');

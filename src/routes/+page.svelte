@@ -41,7 +41,7 @@
 
   $: currentImage = project?.images.find((image) => image.id === currentId) ?? null;
   $: filteredImages = (project?.images ?? []).filter((image) => {
-    if (image.id === currentId) return true;
+    if (image.id === currentId) return classFilters.every((classId) => boxes.some((box) => box.classId === classId));
     const matchesSearch = image.name.toLowerCase().includes(search.toLowerCase());
     const matchesFilter = filter === 'all' || (filter === 'excluded' && image.excluded) || (filter === 'annotated' && !image.excluded && image.annotated && !image.empty) || (filter === 'unannotated' && !image.excluded && !image.annotated) || (filter === 'empty' && !image.excluded && image.empty);
     const imageBoxes = boxesByImage[image.id] ?? [];
