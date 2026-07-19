@@ -71,6 +71,28 @@ test.describe.serial('интерфейс', () => {
     await check();
   });
 
+  test('B плавно перелистывает bbox и не дёргается при быстром повторе', async ({ page }) => {
+    await page.goto('/');
+    await expect(caption(page)).toContainText('crowd-person.png');
+    await page.keyboard.press('b');
+    await expect(page.locator('.selection-card')).toContainText('1 / 4');
+    await page.waitForTimeout(220);
+
+    const zoomSamples = page.evaluate(() => new Promise<string[]>((resolve) => {
+      const target = document.querySelector('.canvas-tools span')!;
+      const values = [target.textContent ?? ''];
+      const observer = new MutationObserver(() => values.push(target.textContent ?? ''));
+      observer.observe(target, { childList: true, characterData: true, subtree: true });
+      setTimeout(() => { observer.disconnect(); resolve(values); }, 360);
+    }));
+    await page.keyboard.press('b');
+    await page.waitForTimeout(35);
+    await page.keyboard.press('b');
+
+    await expect(page.locator('.selection-card')).toContainText('3 / 4');
+    expect(new Set(await zoomSamples).size).toBeGreaterThan(3);
+  });
+
   test('кнопки статусов и поиск фильтруют список кадров', async ({ page }) => {
     await page.goto('/');
     await expect(caption(page)).toContainText('crowd-person.png');

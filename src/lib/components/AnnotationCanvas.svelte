@@ -85,13 +85,33 @@
     const centeredY = hostHeight / 2 - (box.y + box.height / 2) * scale;
     const edgeSpaceX = box.width * scale / 2;
     const edgeSpaceY = box.height * scale / 2;
-    viewport = {
+    animateViewport({
       scale,
       offsetX: scaledWidth <= hostWidth ? (hostWidth - scaledWidth) / 2 : clamp(centeredX, hostWidth - scaledWidth - edgeSpaceX, edgeSpaceX),
       offsetY: scaledHeight <= hostHeight ? (hostHeight - scaledHeight) / 2 : clamp(centeredY, hostHeight - scaledHeight - edgeSpaceY, edgeSpaceY)
-    };
-    dispatch('viewport', Math.round(scale * 100));
+    });
+  }
+
+  function applyViewport(next: Viewport) {
+    viewport = next;
+    dispatch('viewport', Math.round(next.scale * 100));
     draw();
+  }
+
+  function animateViewport(target: Viewport) {
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { applyViewport(target); return; }
+    const start = { ...viewport }, duration = 170, startedAt = performance.now();
+    const step = (now: number) => {
+      const progress = clamp((now - startedAt) / duration, 0, 1);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      applyViewport({
+        scale: start.scale + (target.scale - start.scale) * eased,
+        offsetX: start.offsetX + (target.offsetX - start.offsetX) * eased,
+        offsetY: start.offsetY + (target.offsetY - start.offsetY) * eased
+      });
+      if (progress < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
   }
 
   function draw() {
