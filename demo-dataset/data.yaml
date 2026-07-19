@@ -1,7 +1,10 @@
 path: .
-train: train
-val: train
-nc: 2
+train: train/images
+val: train/images
+nc: 5
 names:
   0: fox
   1: bird
+  2: car
+  3: truck
+  4: person

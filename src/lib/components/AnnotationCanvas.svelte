@@ -10,18 +10,23 @@
   export let currentClass = 0;
   export let classes: string[] = [];
   export let showLabels = true;
+  export let readOnly = false;
 
   const dispatch = createEventDispatcher<{
     change: BoundingBox[];
     commit: { before: BoundingBox[]; boxes: BoundingBox[] };
     select: string | null;
     viewport: number;
+    ready: string;
+    loaderror: string;
   }>();
   let canvas: HTMLCanvasElement;
   let host: HTMLDivElement;
   let ctx: CanvasRenderingContext2D;
   let image = new Image();
   let loaded = false;
+  let imageLoadSequence = 0;
+  let fittedDims = '';
   let viewport: Viewport = { scale: 1, offsetX: 0, offsetY: 0 };
   let spaceDown = false;
   let action: null | { type: 'pan' | 'create' | 'move' | 'resize'; startX: number; startY: number; before: BoundingBox[]; box?: BoundingBox; handle?: string; startViewport?: Viewport } = null;
@@ -29,12 +34,19 @@
 
   $: if (imageUrl) loadImage(imageUrl);
   $: if (ctx && loaded && boxes && selectedId !== undefined && showLabels !== undefined) draw();
+  $: if (loaded && host && imageInfo.width && `${imageInfo.width}x${imageInfo.height}` !== fittedDims) fit();
 
   function loadImage(url: string) {
+    const request = ++imageLoadSequence;
     loaded = false;
-    image = new Image();
-    image.onload = () => { loaded = true; fit(); };
-    image.src = url;
+    draw();
+    const candidate = new Image();
+    candidate.onload = () => {
+      if (request !== imageLoadSequence || url !== imageUrl) return;
+      image = candidate; loaded = true; fit(); dispatch('ready', url);
+    };
+    candidate.onerror = () => { if (request === imageLoadSequence && url === imageUrl) dispatch('loaderror', url); };
+    candidate.src = url;
   }
 
   function resize() {
@@ -43,8 +55,6 @@
     const rect = host.getBoundingClientRect();
     canvas.width = Math.round(rect.width * ratio);
     canvas.height = Math.round(rect.height * ratio);
-    canvas.style.width = `${rect.width}px`;
-    canvas.style.height = `${rect.height}px`;
     ctx = canvas.getContext('2d')!;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     if (loaded) fit(); else draw();
@@ -52,6 +62,7 @@
 
   export function fit() {
     if (!host || !loaded) return;
+    fittedDims = `${imageInfo.width}x${imageInfo.height}`;
     viewport = fitViewport(host.clientWidth, host.clientHeight, imageInfo.width, imageInfo.height);
     dispatch('viewport', Math.round(viewport.scale * 100));
     draw();
@@ -152,6 +163,7 @@
     if (spaceDown || event.button === 1) {
       action = { type: 'pan', startX: p.x, startY: p.y, before, startViewport: { ...viewport } }; return;
     }
+    if (readOnly) { dispatch('select', hitBox(p.x, p.y)?.id ?? null); return; }
     const handle = selectedHandle(p.x, p.y);
     if (handle) {
       const box = boxes.find((b) => b.id === selectedId)!;
