@@ -49,6 +49,7 @@
   let searchTimer: ReturnType<typeof setTimeout>;
   let imageList: HTMLDivElement;
   let revealedId: string | null = null;
+  let frameRouteInitialized = false;
   const frameCache = new Map<string, Promise<{ boxes: BoundingBox[]; image: typeof project.images[number]; saved: boolean }>>();
   const history = new BoxHistory();
 
@@ -79,6 +80,16 @@
   const formatCount = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
   const formatConfidence = (value: number) => value < 0.01 ? value.toFixed(4) : value.toFixed(2);
 
+  function routedFrameId() { return new URL(window.location.href).searchParams.get('frame'); }
+
+  function syncFrameRoute(id: string) {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('frame') === id) { frameRouteInitialized = true; return; }
+    url.searchParams.set('frame', id);
+    window.history[frameRouteInitialized ? 'pushState' : 'replaceState']({}, '', url);
+    frameRouteInitialized = true;
+  }
+
   function runtimeScope() {
     return { query: search, status: filter === 'excluded' ? 'excluded' : 'active', classIds: classFilters };
   }
@@ -90,7 +101,7 @@
     return params;
   }
 
-  async function loadRuntimeProject(query = '', preferredImage: typeof project.images[number] | null = null) {
+  async function loadRuntimeProject(query = '', preferredImage: typeof project.images[number] | null = null, preferredId: string | null = null) {
     saveError = '';
     try {
       const response = await fetch(`/__boxscribe/project?${runtimeParams({ limit: 200, query })}`);
@@ -98,10 +109,18 @@
       if (!response.ok) throw new Error(body.message);
       project = body;
       currentId = null;
-      if (preferredImage && !project.images.some((image) => image.id === preferredImage.id)) {
-        project = { ...project, images: [...project.images, preferredImage].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+      let target = preferredImage ?? (preferredId ? project.images.find((image) => image.id === preferredId) : null) ?? null;
+      if (!target && preferredId) {
+        const itemResponse = await fetch(`/__boxscribe/item?id=${encodeURIComponent(preferredId)}`);
+        if (itemResponse.ok) target = await itemResponse.json();
       }
-      const target = preferredImage ?? body.images[0] ?? null;
+      if (target) {
+        const targetId = target.id;
+        if (!project.images.some((image) => image.id === targetId)) {
+          project = { ...project, images: [...project.images, target].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+        }
+      }
+      target ??= body.images[0] ?? null;
       if (target) await openImage(target.id);
     } catch (error) { saveError = error instanceof Error ? error.message : 'Не удалось открыть датасет'; }
   }
@@ -215,7 +234,7 @@
     if (JSON.stringify(event.detail.before) !== JSON.stringify(event.detail.boxes)) history.push(event.detail.before);
   }
 
-  async function openImage(id: string) {
+  async function openImage(id: string, updateRoute = true) {
     if (id === currentId && !loadingFrame) return;
     const request = ++frameRequestSequence;
     const target = project.images.find((image) => image.id === id);
@@ -232,11 +251,13 @@
         currentId = id; boxes = body.boxes; selectedId = null; dirty = false; history.reset(); savedAt = body.saved ? 'Из YOLO TXT' : '';
         project = { ...project, images: project.images.map((image) => image.id === id ? body.image : image) };
         localStorage.setItem('boxscribe:last-image', id);
+        if (updateRoute) syncFrameRoute(id);
         void preloadNeighbor(target, -1); void preloadNeighbor(target, 1);
       } else {
         awaitingCanvas = true;
         currentId = id;
         await loadAnnotations();
+        if (updateRoute) syncFrameRoute(id);
       }
     } catch (error) {
       if (request === frameRequestSequence) saveError = error instanceof Error ? error.message : 'Ошибка загрузки';
@@ -475,17 +496,33 @@
     else if (shortcuts.nextClass.includes(key as never)) changeSelectedClass((currentClass + 1) % (project?.classes.length ?? 1));
   }
 
+  async function handleFrameRoute() {
+    frameRouteInitialized = true;
+    const id = routedFrameId();
+    if (!id || id === currentId) return;
+    let target = project.images.find((image) => image.id === id);
+    if (!target && runtimeDataset) {
+      const response = await fetch(`/__boxscribe/item?id=${encodeURIComponent(id)}`);
+      if (response.ok) {
+        target = await response.json();
+        project = { ...project, images: [...project.images, target!].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+      }
+    }
+    if (target) await openImage(target.id, false);
+  }
+
   onMount(() => {
     window.addEventListener('keydown', keyHandler);
-    if (runtimeDataset) { loadRuntimeProject(); loadDetectionModels(); }
+    window.addEventListener('popstate', handleFrameRoute);
+    const requestedFrame = routedFrameId() ?? localStorage.getItem('boxscribe:last-image');
+    if (runtimeDataset) { loadRuntimeProject('', null, requestedFrame); loadDetectionModels(); }
     else {
-      const remembered = localStorage.getItem('boxscribe:last-image');
-      if (remembered && project.images.some((image) => image.id === remembered)) currentId = remembered;
+      if (requestedFrame && project.images.some((image) => image.id === requestedFrame)) currentId = requestedFrame;
       if (currentId) loadAnnotations();
     }
     const beforeUnload = (event: BeforeUnloadEvent) => { if (dirty) { event.preventDefault(); event.returnValue = ''; } };
     window.addEventListener('beforeunload', beforeUnload);
-    return () => { window.removeEventListener('keydown', keyHandler); window.removeEventListener('beforeunload', beforeUnload); clearTimeout(autosaveTimer); clearTimeout(searchTimer); };
+    return () => { window.removeEventListener('keydown', keyHandler); window.removeEventListener('popstate', handleFrameRoute); window.removeEventListener('beforeunload', beforeUnload); clearTimeout(autosaveTimer); clearTimeout(searchTimer); };
   });
 </script>
 

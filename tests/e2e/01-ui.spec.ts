@@ -187,6 +187,25 @@ test.describe.serial('интерфейс', () => {
     await expect(frameInput(page)).toHaveValue('5');
   });
 
+  test('URL сохраняет открытый кадр после reload и поддерживает Back', async ({ page }) => {
+    await page.goto('/');
+    await expect(caption(page)).toContainText('crowd-person.png');
+
+    await row(page, 'demo-fox.png').locator('.image-open').click();
+    await expect(caption(page)).toContainText('demo-fox.png');
+    const foxFrame = new URL(page.url()).searchParams.get('frame');
+    expect(foxFrame).toBeTruthy();
+
+    await page.reload();
+    await expect(caption(page)).toContainText('demo-fox.png');
+    expect(new URL(page.url()).searchParams.get('frame')).toBe(foxFrame);
+
+    await row(page, 'demo-bird.png').locator('.image-open').click();
+    await expect(caption(page)).toContainText('demo-bird.png');
+    await page.goBack();
+    await expect(caption(page)).toContainText('demo-fox.png');
+  });
+
   test('«Следующий неразмеченный», подписи и вписывание кадра работают', async ({ page }) => {
     await page.goto('/');
     await expect(caption(page)).toContainText('crowd-person.png');

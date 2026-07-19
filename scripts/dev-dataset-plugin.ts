@@ -320,7 +320,9 @@ export function datasetDevPlugin(): Plugin {
             return sendJson(res, { name: path.basename(index.root), imageDir: index.root, classes: index.classes, images: page.map(item), lastImageId: first ? recordId(first) : null, totalImages: records.length, activeImages: index.records.length, annotatedCount: index.annotatedCount, resultCount: source.length, excludedCount: index.excludedRecords.length });
           }
           if (url.pathname === '/__boxscribe/item') {
-            const record = index.records[Number(url.searchParams.get('index'))];
+            const id = url.searchParams.get('id');
+            const record = id ? findRecord(index, id) : index.records[Number(url.searchParams.get('index'))];
+            if (record) await hydrateLabel(index, record);
             return record ? sendJson(res, item(record)) : sendJson(res, { message: 'Кадр не найден' }, 404);
           }
           if (url.pathname === '/__boxscribe/neighbor') {
