@@ -11,9 +11,9 @@
   import type { BoundingBox, ProjectState } from '$lib/annotation/types';
   import { boxesByImage, project as generatedProject } from '$lib/generated/dataset';
 
-  let project: ProjectState = generatedProject;
   const runtimeDataset = import.meta.env.DEV;
-  let currentId: string | null = project?.lastImageId ?? project?.images[0]?.id ?? null;
+  let project: ProjectState = generatedProject;
+  let currentId: string | null = runtimeDataset ? null : project?.lastImageId ?? project?.images[0]?.id ?? null;
   let boxes: BoundingBox[] = [];
   let selectedId: string | null = null;
   let focusedId: string | null = null;
