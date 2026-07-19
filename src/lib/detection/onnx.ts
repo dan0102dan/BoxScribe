@@ -9,7 +9,6 @@ type DecodeStats = { bestScore: number };
 
 type LoadedSession = { session: import('onnxruntime-web').InferenceSession; backend: 'webgpu' | 'wasm' };
 const sessions = new Map<string, Promise<LoadedSession>>();
-let maxCachedSessions = 3;
 
 function iou(a: Detection, b: Detection) {
   const left = Math.max(a.x, b.x), top = Math.max(a.y, b.y);
@@ -93,7 +92,6 @@ async function loadSession(url: string) {
     sessions.delete(url); sessions.set(url, pending);
   }
   if (!pending) {
-    while (sessions.size >= maxCachedSessions) await releaseOnnxSession(sessions.keys().next().value!);
     pending = import('onnxruntime-web').then(async ({ env, InferenceSession }) => {
       env.wasm.wasmPaths = { wasm: new URL(wasmUrl, window.location.href).href };
       if ('gpu' in navigator) {
@@ -119,7 +117,6 @@ export async function releaseOnnxSession(url: string) {
 export function isOnnxSessionCached(url: string) { return sessions.has(url); }
 
 export async function warmOnnxSessions(urls: string[]) {
-  maxCachedSessions = Math.max(maxCachedSessions, urls.length);
   for (const url of urls) await loadSession(url);
 }
 
