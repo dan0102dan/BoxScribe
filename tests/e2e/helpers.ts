@@ -36,12 +36,16 @@ export const caption = (page: Page) => page.locator('.top-image-caption');
 export const frameInput = (page: Page) => page.getByLabel('Перейти к номеру кадра');
 
 // Набирает номер кадра реальными нажатиями: программный fill не взводит
-// «dirty»-флаг поля, и blur может не выдать событие change.
+// «dirty»-флаг поля, и blur может не выдать событие change. Ввод обёрнут в
+// retry: placeFrameCaretAtEnd ставит каретку через requestAnimationFrame и на
+// медленной машине может схлопнуть выделение между Ctrl+A и набором текста.
 export async function jumpToFrameNumber(page: Page, frame: string) {
-  await frameInput(page).click();
-  await page.keyboard.press('ControlOrMeta+a');
-  await page.keyboard.type(frame);
-  await expect(frameInput(page)).toHaveValue(frame);
+  await expect(async () => {
+    await frameInput(page).click();
+    await page.keyboard.press('ControlOrMeta+a');
+    await page.keyboard.type(frame);
+    await expect(frameInput(page)).toHaveValue(frame, { timeout: 500 });
+  }).toPass({ timeout: 10_000 });
   await page.keyboard.press('Enter');
 }
 
