@@ -116,10 +116,6 @@ export async function releaseOnnxSession(url: string) {
 
 export function isOnnxSessionCached(url: string) { return sessions.has(url); }
 
-export async function warmOnnxSessions(urls: string[]) {
-  for (const url of urls) await loadSession(url);
-}
-
 export async function detectOnnx(modelUrl: string, imageUrl: string, classCount: number, confidence: number) {
   const startedAt = performance.now();
   const { session, backend } = await loadSession(modelUrl);

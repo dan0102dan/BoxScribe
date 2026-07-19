@@ -6,7 +6,7 @@
   import Icon from '$lib/components/Icon.svelte';
   import { BoxHistory } from '$lib/annotation/history';
   import { serializeYolo } from '$lib/annotation/yolo';
-  import { detectOnnx, isOnnxSessionCached, mergeDetections, warmOnnxSessions, type Detection } from '$lib/detection/onnx';
+  import { detectOnnx, isOnnxSessionCached, mergeDetections, type Detection } from '$lib/detection/onnx';
   import { shortcuts } from '$lib/config/shortcuts';
   import type { BoundingBox, ProjectState } from '$lib/annotation/types';
   import { boxesByImage, project as generatedProject } from '$lib/generated/dataset';
@@ -421,11 +421,6 @@
       modelsDirectory = body.directory;
       const remembered = localStorage.getItem('boxscribe:detection-model');
       selectedModel = detectionModels.some((model) => model.id === remembered) ? remembered! : detectionModels[0]?.id ?? '';
-      const ordered = [...detectionModels].sort((a, b) => Number(b.id === selectedModel) - Number(a.id === selectedModel));
-      if (!navigator.webdriver) {
-        void warmOnnxSessions(ordered.map((model) => `/__boxscribe/model?name=${encodeURIComponent(model.id)}`))
-          .catch((error) => console.warn('Не удалось заранее загрузить ONNX-модели.', error));
-      }
     } catch (error) { detectionError = error instanceof Error ? error.message : 'Не удалось найти ONNX-модели'; }
   }
 

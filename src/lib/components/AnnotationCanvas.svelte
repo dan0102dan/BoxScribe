@@ -290,7 +290,7 @@
 </script>
 
 <div class:grabbing={action?.type === 'pan'} class:space={spaceDown} class="canvas-host" bind:this={host}>
-  <canvas bind:this={canvas} style:cursor={cursor} on:pointerdown={pointerDown} on:pointermove={pointerMove} on:pointerup={pointerUp} on:pointercancel={pointerUp} on:wheel={wheel}></canvas>
+  <canvas bind:this={canvas} style:cursor={cursor} on:pointerdown={pointerDown} on:pointermove={pointerMove} on:pointerup={pointerUp} on:pointercancel={pointerUp} on:wheel|nonpassive={wheel}></canvas>
 </div>
 
 <style>
