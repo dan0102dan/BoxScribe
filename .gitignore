@@ -7,3 +7,7 @@ build
 .boxscribe
 static/dataset
 *.log
+
+# Keep the approved default model only; local experiments must not enter Git.
+models/*.onnx
+!models/yolov5m.onnx

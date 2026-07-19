@@ -253,6 +253,41 @@ function sendJson(res: ServerResponse, value: unknown, status = 200) {
   res.statusCode = status; res.setHeader('content-type', 'application/json; charset=utf-8'); res.end(JSON.stringify(value));
 }
 
+function modelsDirectory(index: DatasetIndex) {
+  return path.resolve(process.env.BOXSCRIBE_MODELS_DIR || 'models');
+}
+
+async function availableModels(index: DatasetIndex) {
+  try {
+    const entries = await readdir(modelsDirectory(index), { withFileTypes: true });
+    const files = entries.filter((entry) => entry.isFile() && path.extname(entry.name).toLowerCase() === '.onnx');
+    const models = await Promise.all(files.map(async (entry) => ({
+      id: entry.name,
+      name: path.basename(entry.name, path.extname(entry.name)),
+      classes: await onnxClassNames(path.join(modelsDirectory(index), entry.name))
+    })));
+    return models.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function onnxClassNames(source: string) {
+  const handle = await open(source, 'r');
+  try {
+    const info = await handle.stat(), length = Math.min(info.size, 256 * 1024);
+    const tail = Buffer.alloc(length); await handle.read(tail, 0, length, info.size - length);
+    const text = tail.toString('utf8');
+    const metadata = text.match(/names[\s\S]{0,32}(\{[^}]{1,8192}\})/)?.[1];
+    if (!metadata) return [];
+    const names: string[] = [];
+    for (const match of metadata.matchAll(/(\d+)\s*:\s*['"]([^'"]+)['"]/g)) names[Number(match[1])] = match[2];
+    return names.filter((name) => typeof name === 'string');
+  } catch { return []; }
+  finally { await handle.close(); }
+}
+
 async function body(req: IncomingMessage) {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -300,6 +335,19 @@ export function datasetDevPlugin(): Plugin {
             if (!neighbor) return sendJson(res, { message: 'Соседний кадр не найден' }, 404);
             await hydrateLabel(index, neighbor);
             return sendJson(res, item(neighbor));
+          }
+          if (url.pathname === '/__boxscribe/models' && req.method === 'GET') {
+            return sendJson(res, { models: await availableModels(index), directory: modelsDirectory(index) });
+          }
+          if (url.pathname === '/__boxscribe/model' && req.method === 'GET') {
+            const name = url.searchParams.get('name') || '';
+            const allowed = (await availableModels(index)).some((model) => model.id === name);
+            if (!allowed) return sendJson(res, { message: 'ONNX-модель не найдена' }, 404);
+            const source = path.join(modelsDirectory(index), name);
+            res.statusCode = 200;
+            res.setHeader('content-type', 'application/octet-stream');
+            res.setHeader('cache-control', 'private, max-age=3600');
+            return createReadStream(source).pipe(res);
           }
           const rawId = url.searchParams.get('id') || '';
           const record = findRecord(index, rawId);

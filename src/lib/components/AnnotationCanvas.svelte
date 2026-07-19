@@ -143,7 +143,9 @@
     ctx.fillStyle = `${color}${selected ? '1f' : '0d'}`;
     ctx.fillRect(p.x, p.y, w, h); ctx.strokeRect(p.x, p.y, w, h);
     if (showLabels) {
-      const label = classes[box.classId] ?? `class ${box.classId}`;
+      const classLabel = classes[box.classId] ?? `class ${box.classId}`;
+      const confidence = box.confidence === undefined ? '' : box.confidence < 0.01 ? box.confidence.toFixed(4) : box.confidence.toFixed(2);
+      const label = confidence ? `${classLabel} · ${confidence}` : classLabel;
       ctx.font = '600 12px Inter, system-ui';
       const labelWidth = ctx.measureText(label).width + 14;
       ctx.fillStyle = color; ctx.fillRect(p.x, Math.max(0, p.y - 22), labelWidth, 22);
