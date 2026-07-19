@@ -308,7 +308,10 @@
 
   function removeSelected() {
     if (!selectedId || currentImage?.excluded) return;
-    history.push(boxes); boxes = boxes.filter((box) => box.id !== selectedId); selectedId = null; focusedId = null; markDirty();
+    const removedIndex = boxes.findIndex((box) => box.id === selectedId);
+    history.push(boxes); boxes = boxes.filter((box) => box.id !== selectedId);
+    selectBox(boxes.length && removedIndex >= 0 ? boxes[removedIndex % boxes.length].id : null);
+    markDirty();
   }
 
   function changeSelectedClass(classId: number) {

@@ -93,6 +93,22 @@ test.describe.serial('интерфейс', () => {
     expect(new Set(await zoomSamples).size).toBeGreaterThan(3);
   });
 
+  test('B после удаления продолжает с bbox, который шёл следом', async ({ page }) => {
+    await page.goto('/');
+    await expect(caption(page)).toContainText('crowd-person.png');
+
+    await page.keyboard.press('b');
+    await page.keyboard.press('b');
+    await expect(page.locator('.selection-card')).toContainText('2 / 4');
+
+    await page.keyboard.press('Backspace');
+    await expect(page.locator('.boxes-head small')).toHaveText('3');
+    await expect(page.locator('.selection-card')).toContainText('2 / 3');
+
+    await page.keyboard.press('b');
+    await expect(page.locator('.selection-card')).toContainText('2 / 3');
+  });
+
   test('кнопки статусов и поиск фильтруют список кадров', async ({ page }) => {
     await page.goto('/');
     await expect(caption(page)).toContainText('crowd-person.png');
