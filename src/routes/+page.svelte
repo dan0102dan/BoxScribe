@@ -550,7 +550,7 @@
       <div class="class-list">
         {#each project.classes as className, index}<button class:active={currentClass === index} style={`--class-color:var(--c${index % 9})`} on:click={() => changeSelectedClass(index)}><i></i><span><b>{className}</b><small>{selectedBox ? 'Применить к выбранному' : 'Для следующего bbox'}</small></span>{#if index < 9}<kbd>{index + 1}</kbd>{/if}</button>{/each}
       </div>
-      <div class="panel-head boxes-head"><span>Объекты</span><div class="box-panel-actions"><small>{boxes.length}</small><button on:click={clearAllBoxes} disabled={!boxes.length || Boolean(currentImage?.excluded)} title="Удалить все bbox (Shift+Delete)"><Icon name="trash" size={14}/></button></div></div>
+      <div class="panel-head boxes-head"><span>Объекты</span><div class="box-panel-actions"><small>{boxes.length}</small><button on:click={clearAllBoxes} disabled={!boxes.length || Boolean(currentImage?.excluded)} title="Очистить все bbox (Shift+Delete)"><Icon name="trash" size={14}/></button></div></div>
       <div class="box-list">
         {#each boxes as box, index}<button class:active={box.id === selectedId} on:click={() => selectBox(box.id)}><i style={`--class-color:var(--c${box.classId % 9})`}></i><span><b>{project.classes[box.classId] ?? `Класс ${box.classId}`}{#if box.confidence !== undefined}<em>{formatConfidence(box.confidence)}</em>{/if}</b><small>#{index + 1} · {Math.round(box.width)}×{Math.round(box.height)}</small></span></button>{/each}
         {#if !boxes.length}<div class="empty-boxes"><span>＋</span><b>Нарисуйте первый bbox</b><small>Протяните мышью по объекту</small></div>{/if}
