@@ -1,6 +1,9 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { browser } from '$app/environment';
+  import { pushState, replaceState } from '$app/navigation';
   import { base } from '$app/paths';
+  import { page } from '$app/stores';
   import JSZip from 'jszip';
   import AnnotationCanvas from '$lib/components/AnnotationCanvas.svelte';
   import Icon from '$lib/components/Icon.svelte';
@@ -49,7 +52,7 @@
   let searchTimer: ReturnType<typeof setTimeout>;
   let imageList: HTMLDivElement;
   let revealedId: string | null = null;
-  let frameRouteInitialized = false;
+  let routeReady = false;
   const frameCache = new Map<string, Promise<{ boxes: BoundingBox[]; image: typeof project.images[number]; saved: boolean }>>();
   const history = new BoxHistory();
 
@@ -80,15 +83,43 @@
   const formatCount = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
   const formatConfidence = (value: number) => value < 0.01 ? value.toFixed(4) : value.toFixed(2);
 
-  function routedFrameId() { return new URL(window.location.href).searchParams.get('frame'); }
-
+  // The visible frame owns the URL: openImage records it through SvelteKit's
+  // shallow routing, and the $page watcher below follows Back/Forward.
   function syncFrameRoute(id: string) {
     const url = new URL(window.location.href);
-    if (url.searchParams.get('frame') === id) { frameRouteInitialized = true; return; }
+    const previous = url.searchParams.get('frame');
+    if (previous === id) return;
     url.searchParams.set('frame', id);
-    window.history[frameRouteInitialized ? 'pushState' : 'replaceState']({}, '', url);
-    frameRouteInitialized = true;
+    // Push only over a frame that actually resolved, so Back never lands on a
+    // dead entry (first open and unknown ids are replaced instead).
+    const navigate = previous && project.images.some((image) => image.id === previous) ? pushState : replaceState;
+    navigate(url, { frame: id });
   }
+
+  function mergeFrame(image: typeof project.images[number]) {
+    if (!project.images.some((candidate) => candidate.id === image.id)) {
+      project = { ...project, images: [...project.images, image].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+    }
+    return image;
+  }
+
+  async function resolveFrameTarget(id: string) {
+    const known = project.images.find((image) => image.id === id);
+    if (known || !runtimeDataset) return known ?? null;
+    const response = await fetch(`/__boxscribe/item?id=${encodeURIComponent(id)}`);
+    return response.ok ? mergeFrame(await response.json()) : null;
+  }
+
+  async function followFrameRoute(id: string) {
+    if (id === currentId) return;
+    const target = await resolveFrameTarget(id);
+    if (target) await openImage(target.id);
+  }
+
+  // Shallow navigation carries the frame in $page.state; $page.url only moves
+  // on real navigations (initial load, reload), where it is the source instead.
+  $: routedFrame = browser ? $page.state.frame ?? $page.url.searchParams.get('frame') : null;
+  $: if (routeReady && routedFrame) void followFrameRoute(routedFrame);
 
   function runtimeScope() {
     return { query: search, status: filter === 'excluded' ? 'excluded' : 'active', classIds: classFilters };
@@ -109,18 +140,9 @@
       if (!response.ok) throw new Error(body.message);
       project = body;
       currentId = null;
-      let target = preferredImage ?? (preferredId ? project.images.find((image) => image.id === preferredId) : null) ?? null;
-      if (!target && preferredId) {
-        const itemResponse = await fetch(`/__boxscribe/item?id=${encodeURIComponent(preferredId)}`);
-        if (itemResponse.ok) target = await itemResponse.json();
-      }
-      if (target) {
-        const targetId = target.id;
-        if (!project.images.some((image) => image.id === targetId)) {
-          project = { ...project, images: [...project.images, target].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
-        }
-      }
-      target ??= body.images[0] ?? null;
+      const target = (preferredImage ? mergeFrame(preferredImage) : null)
+        ?? (preferredId ? await resolveFrameTarget(preferredId) : null)
+        ?? body.images[0] ?? null;
       if (target) await openImage(target.id);
     } catch (error) { saveError = error instanceof Error ? error.message : 'Не удалось открыть датасет'; }
   }
@@ -234,7 +256,7 @@
     if (JSON.stringify(event.detail.before) !== JSON.stringify(event.detail.boxes)) history.push(event.detail.before);
   }
 
-  async function openImage(id: string, updateRoute = true) {
+  async function openImage(id: string) {
     if (id === currentId && !loadingFrame) return;
     const request = ++frameRequestSequence;
     const target = project.images.find((image) => image.id === id);
@@ -251,13 +273,13 @@
         currentId = id; boxes = body.boxes; selectedId = null; dirty = false; history.reset(); savedAt = body.saved ? 'Из YOLO TXT' : '';
         project = { ...project, images: project.images.map((image) => image.id === id ? body.image : image) };
         localStorage.setItem('boxscribe:last-image', id);
-        if (updateRoute) syncFrameRoute(id);
+        syncFrameRoute(id);
         void preloadNeighbor(target, -1); void preloadNeighbor(target, 1);
       } else {
         awaitingCanvas = true;
         currentId = id;
         await loadAnnotations();
-        if (updateRoute) syncFrameRoute(id);
+        syncFrameRoute(id);
       }
     } catch (error) {
       if (request === frameRequestSequence) saveError = error instanceof Error ? error.message : 'Ошибка загрузки';
@@ -427,6 +449,8 @@
 
   async function runDetection(runAll = false) {
     if (!currentImage || !selectedModel || detecting || currentImage.excluded) return;
+    // An emptied number input binds null, which would disable the threshold entirely.
+    detectionConfidence = Number.isFinite(detectionConfidence) ? Math.min(1, Math.max(0, detectionConfidence)) : 0.25;
     const targetId = currentImage.id;
     const selected = detectionModels.find((candidate) => candidate.id === selectedModel);
     const models = runAll
@@ -437,7 +461,7 @@
     localStorage.setItem('boxscribe:detection-model', selectedModel);
     try {
       const combined: Detection[] = [];
-      let bestScore = 0, inferenceMs = 0, totalMs = 0, sessionMs = 0;
+      let bestScore = 0, inferenceMs = 0, totalMs = 0, sessionMs = 0, unmatched = 0;
       const inputSizes = new Set<string>(), backends = new Set<'webgpu' | 'wasm'>();
       for (let index = 0; index < models.length; index++) {
         const model = models[index];
@@ -451,21 +475,30 @@
         combined.push(...result.detections.flatMap((box) => {
           const modelClassName = modelClasses[box.classId];
           const mappedClass = project.classes.findIndex((className) => className.toLowerCase() === modelClassName?.toLowerCase());
-          if (model.classes?.length && mappedClass < 0) return [];
+          if (model.classes?.length && mappedClass < 0) { unmatched++; return []; }
           return [{ ...box, classId: mappedClass >= 0 ? mappedClass : box.classId }];
         }));
       }
-      const merged = mergeDetections(combined, 0.5);
-      const next = merged.map(({ score, ...box }) => ({ ...box, confidence: score, id: crypto.randomUUID() }));
+      // In append mode existing boxes join the NMS as unbeatable entries, so a
+      // re-run never stacks duplicates over what is already annotated.
+      const existing: Detection[] = detectionMode === 'append'
+        ? boxes.map(({ classId, x, y, width, height }) => ({ classId, x, y, width, height, score: Number.POSITIVE_INFINITY }))
+        : [];
+      const next = mergeDetections([...existing, ...combined], 0.5)
+        .filter((detection) => Number.isFinite(detection.score))
+        .map(({ score, ...box }) => ({ ...box, confidence: score, id: crypto.randomUUID() }));
       detectionBackend = backends.size === 1 ? [...backends][0] : '';
-      history.push(boxes);
-      boxes = detectionMode === 'append' ? [...boxes, ...next] : next;
-      selectedId = null; markDirty();
+      if (next.length) {
+        history.push(boxes);
+        boxes = detectionMode === 'append' ? [...boxes, ...next] : next;
+        selectedId = null; markDirty();
+      }
+      const dropped = unmatched ? ` · без совпадения классов: ${unmatched}` : '';
       detectionMessage = next.length
-        ? `${runAll ? `Ансамбль ${models.length} моделей` : 'Найдено'}: ${next.length}`
+        ? `${runAll ? `Ансамбль ${models.length} моделей` : 'Найдено'}: ${next.length}${dropped}`
         : bestScore > 0
-          ? `Ничего выше ${formatConfidence(detectionConfidence)} · лучший кандидат ${formatConfidence(bestScore)}`
-          : 'Кандидаты не найдены';
+          ? `Ничего выше ${formatConfidence(detectionConfidence)} · лучший кандидат ${formatConfidence(bestScore)}${dropped}`
+          : `Кандидаты не найдены${dropped}`;
       const seconds = (value: number) => value < 1000 ? `${Math.round(value)} мс` : `${(value / 1000).toFixed(1)} с`;
       detectionMetrics = `${[...inputSizes].join(', ')} · инференс ${seconds(inferenceMs)} · всего ${seconds(totalMs)}${sessionMs > 500 ? ` · запуск ${seconds(sessionMs)}` : ''}`;
     } catch (error) { detectionError = error instanceof Error ? error.message : 'Ошибка ONNX-детекции'; }
@@ -492,33 +525,18 @@
     else if (shortcuts.nextClass.includes(key as never)) changeSelectedClass((currentClass + 1) % (project?.classes.length ?? 1));
   }
 
-  async function handleFrameRoute() {
-    frameRouteInitialized = true;
-    const id = routedFrameId();
-    if (!id || id === currentId) return;
-    let target = project.images.find((image) => image.id === id);
-    if (!target && runtimeDataset) {
-      const response = await fetch(`/__boxscribe/item?id=${encodeURIComponent(id)}`);
-      if (response.ok) {
-        target = await response.json();
-        project = { ...project, images: [...project.images, target!].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
-      }
-    }
-    if (target) await openImage(target.id, false);
-  }
-
   onMount(() => {
     window.addEventListener('keydown', keyHandler);
-    window.addEventListener('popstate', handleFrameRoute);
-    const requestedFrame = routedFrameId() ?? localStorage.getItem('boxscribe:last-image');
-    if (runtimeDataset) { loadRuntimeProject('', null, requestedFrame); loadDetectionModels(); }
+    const requestedFrame = $page.url.searchParams.get('frame') ?? localStorage.getItem('boxscribe:last-image');
+    if (runtimeDataset) { loadRuntimeProject('', null, requestedFrame).finally(() => routeReady = true); loadDetectionModels(); }
     else {
       if (requestedFrame && project.images.some((image) => image.id === requestedFrame)) currentId = requestedFrame;
       if (currentId) loadAnnotations();
+      routeReady = true;
     }
     const beforeUnload = (event: BeforeUnloadEvent) => { if (dirty) { event.preventDefault(); event.returnValue = ''; } };
     window.addEventListener('beforeunload', beforeUnload);
-    return () => { window.removeEventListener('keydown', keyHandler); window.removeEventListener('popstate', handleFrameRoute); window.removeEventListener('beforeunload', beforeUnload); clearTimeout(autosaveTimer); clearTimeout(searchTimer); };
+    return () => { window.removeEventListener('keydown', keyHandler); window.removeEventListener('beforeunload', beforeUnload); clearTimeout(autosaveTimer); clearTimeout(searchTimer); };
   });
 </script>
 
@@ -579,10 +597,10 @@
             <button class="detect-btn" on:click={() => runDetection(false)} disabled={detecting || !currentImage || Boolean(currentImage?.excluded)} title="Запустить выбранную модель" aria-label="Запустить выбранную модель">{#if detecting && !detectionRunAll}<i class="spinner"></i>{:else}<Icon name="play" size={14}/>{/if}</button>
             <button class="detect-btn detect-all" on:click={() => runDetection(true)} disabled={detecting || detectionModels.length < 2 || !currentImage || Boolean(currentImage?.excluded)} title="Запустить все модели и объединить bbox (R)" aria-label="Запустить все модели">{#if detecting && detectionRunAll}<i class="spinner"></i><span>{detectionProgress}</span>{:else}<Icon name="play-all" size={14}/>{/if}</button>
           </div>
-          {#if detectionError}<p class="detection-status error">{detectionError}</p>{:else if detectionMessage}<p class="detection-status"><b>{detectionMessage}</b><span>{detectionMetrics}</span></p>{/if}
         {:else}
           <p class="model-empty">Положите файлы <b>.onnx</b> в<br/><code title={modelsDirectory}>{modelsDirectory || 'models'}</code><br/>и обновите страницу.</p>
         {/if}
+        {#if detectionError}<p class="detection-status error">{detectionError}</p>{:else if detectionMessage}<p class="detection-status"><b>{detectionMessage}</b><span>{detectionMetrics}</span></p>{/if}
       </div>
       <div class="panel-head class-mode"><span>{selectedBox ? 'Класс выбранного bbox' : 'Класс нового bbox'}</span><small>{selectedBox ? 'EDIT' : 'DRAW'}</small></div>
       <div class="class-list">

@@ -1,5 +1,5 @@
 import { createReadStream } from 'node:fs';
-import { copyFile, mkdir, open, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Plugin } from 'vite';
@@ -274,18 +274,23 @@ async function availableModels(index: DatasetIndex) {
 }
 
 async function onnxClassNames(source: string) {
-  const handle = await open(source, 'r');
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    handle = await open(source, 'r');
     const info = await handle.stat(), length = Math.min(info.size, 256 * 1024);
     const tail = Buffer.alloc(length); await handle.read(tail, 0, length, info.size - length);
-    const text = tail.toString('utf8');
-    const metadata = text.match(/names[\s\S]{0,32}(\{[^}]{1,8192}\})/)?.[1];
+    const metadata = tail.toString('utf8').match(/names[\s\S]{0,32}(\{[^}]{1,8192}\})/)?.[1];
     if (!metadata) return [];
+    // The metadata blob is a flow mapping like {0: 'person', 1: "person's bike"};
+    // YAML handles quoting/escapes, and holes keep their index so class ids stay
+    // aligned with the model output instead of shifting past a missing entry.
     const names: string[] = [];
-    for (const match of metadata.matchAll(/(\d+)\s*:\s*['"]([^'"]+)['"]/g)) names[Number(match[1])] = match[2];
-    return names.filter((name) => typeof name === 'string');
+    for (const [key, value] of Object.entries(YAML.parse(metadata) as Record<string, unknown>)) {
+      if (Number.isInteger(Number(key)) && Number(key) >= 0 && typeof value === 'string') names[Number(key)] = value;
+    }
+    return Array.from(names, (name) => name ?? '');
   } catch { return []; }
-  finally { await handle.close(); }
+  finally { await handle?.close().catch(() => undefined); }
 }
 
 async function body(req: IncomingMessage) {
@@ -343,13 +348,25 @@ export function datasetDevPlugin(): Plugin {
           }
           if (url.pathname === '/__boxscribe/model' && req.method === 'GET') {
             const name = url.searchParams.get('name') || '';
-            const allowed = (await availableModels(index)).some((model) => model.id === name);
-            if (!allowed) return sendJson(res, { message: 'ONNX-модель не найдена' }, 404);
+            if (name !== path.basename(name) || path.extname(name).toLowerCase() !== '.onnx') return sendJson(res, { message: 'ONNX-модель не найдена' }, 404);
             const source = path.join(modelsDirectory(index), name);
+            let info; try { info = await stat(source); } catch { return sendJson(res, { message: 'ONNX-модель не найдена' }, 404); }
+            if (!info.isFile()) return sendJson(res, { message: 'ONNX-модель не найдена' }, 404);
+            // Weights change on disk under the same name, so the browser must
+            // revalidate; a 304 keeps repeat loads cheap without ever going stale.
+            const etag = `"${info.size}-${Math.round(info.mtimeMs)}"`;
+            res.setHeader('etag', etag);
+            res.setHeader('cache-control', 'private, no-cache');
+            if (req.headers['if-none-match'] === etag) { res.statusCode = 304; return res.end(); }
             res.statusCode = 200;
             res.setHeader('content-type', 'application/octet-stream');
-            res.setHeader('cache-control', 'private, max-age=3600');
-            return createReadStream(source).pipe(res);
+            res.setHeader('content-length', String(info.size));
+            const stream = createReadStream(source);
+            stream.on('error', () => {
+              if (res.headersSent) res.destroy();
+              else sendJson(res, { message: 'Не удалось прочитать ONNX-модель' }, 500);
+            });
+            return stream.pipe(res);
           }
           const rawId = url.searchParams.get('id') || '';
           const record = findRecord(index, rawId);

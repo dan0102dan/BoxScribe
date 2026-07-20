@@ -9,6 +9,10 @@ type DecodeStats = { bestScore: number };
 
 type LoadedSession = { session: import('onnxruntime-web').InferenceSession; backend: 'webgpu' | 'wasm' };
 const sessions = new Map<string, Promise<LoadedSession>>();
+// Each retained session keeps the whole model plus runtime workspace in memory
+// (hundreds of MB for the bundled weights); an unbounded cache gets the tab
+// killed by Safari's memory watchdog.
+const maxCachedSessions = 2;
 
 function iou(a: Detection, b: Detection) {
   const left = Math.max(a.x, b.x), top = Math.max(a.y, b.y);
@@ -47,30 +51,40 @@ export function decodeDetections(output: TensorLike, classCount: number, confide
   if (dims.length < 2) throw new Error(`Неподдерживаемая форма выхода ONNX: [${dims.join(', ')}]`);
   const rows = dims.at(-2)!, columns = dims.at(-1)!;
   const featureSizes = new Set([6, classCount + 4, classCount + 5]);
-  const transposed = (featureSizes.has(rows) && !featureSizes.has(columns)) || (rows >= 5 && rows < columns && rows <= 512);
+  // A transposed export puts a small feature axis before a large candidate axis;
+  // requiring many candidates keeps an [N, 6] end-to-end output with tiny N row-major.
+  const transposed = (featureSizes.has(rows) && !featureSizes.has(columns)) || (rows >= 5 && rows <= 512 && columns > 512);
   const candidates = transposed ? columns : rows;
   const features = transposed ? rows : columns;
   const at = (row: number, column: number) => Number(output.data[transposed ? column * candidates + row : row * features + column]);
+
+  // Layout decisions are per-tensor: a single row on its own (zero padding, a
+  // sigmoid saturated to exactly 0 or 1) can look like the wrong export flavour.
+  // End-to-end exporters emit [x1, y1, x2, y2, score, classId] for EVERY row —
+  // an integer class column (negative allowed as padding) and scores within [0, 1].
+  let endToEnd = features === 6 && candidates > 0;
+  for (let row = 0; endToEnd && row < candidates; row++) {
+    const classValue = at(row, 5), score = at(row, 4);
+    if (!Number.isInteger(classValue) || score < 0 || score > 1) endToEnd = false;
+  }
+  // A one-class YOLOv5 export has 6 features, which is otherwise ambiguous with
+  // a two-class YOLOv8 export; raw YOLOv5 grids are large while raw YOLOv8
+  // exports come transposed, so many row-major candidates identify YOLOv5.
+  const hasObjectness = !endToEnd && (features === classCount + 5 || (features === 6 && candidates > 1000));
+  const classOffset = hasObjectness ? 5 : 4;
+  const availableClasses = Math.min(classCount, features - classOffset);
   const result: Detection[] = [];
 
   for (let row = 0; row < candidates; row++) {
-    // Some exporters keep every proposal but already emit xyxy/confidence/classId.
-    // An integer sixth value distinguishes that layout from YOLOv5's class score.
-    const endToEnd = features === 6 && Number.isInteger(at(row, 5)) && at(row, 5) >= 0 && at(row, 4) >= 0 && at(row, 4) <= 1;
     if (endToEnd) {
       const score = at(row, 4), classId = Math.round(at(row, 5));
       if (stats && Number.isFinite(score)) stats.bestScore = Math.max(stats.bestScore, score);
-      if (score < confidence || classId >= classCount) continue;
+      if (score < confidence || classId < 0 || classId >= classCount) continue;
       const box = restoreBox([at(row, 0), at(row, 1), at(row, 2), at(row, 3)], classId, score, meta, true);
       if (box) result.push(box);
       continue;
     }
 
-    // A one-class YOLOv5 export has 6 features, which is otherwise ambiguous
-    // with a two-class YOLOv8 export. Large candidate grids identify YOLOv5.
-    const hasObjectness = features === classCount + 5 || (features === 6 && candidates > 1000 && features !== classCount + 4);
-    const classOffset = hasObjectness ? 5 : 4;
-    const availableClasses = Math.min(classCount, features - classOffset);
     let classId = -1, classScore = -Infinity;
     for (let index = 0; index < availableClasses; index++) {
       const value = at(row, classOffset + index);
@@ -92,6 +106,7 @@ async function loadSession(url: string) {
     sessions.delete(url); sessions.set(url, pending);
   }
   if (!pending) {
+    while (sessions.size >= maxCachedSessions) await releaseOnnxSession(sessions.keys().next().value!);
     pending = import('onnxruntime-web').then(async ({ env, InferenceSession }) => {
       env.wasm.wasmPaths = { wasm: new URL(wasmUrl, window.location.href).href };
       if ('gpu' in navigator) {

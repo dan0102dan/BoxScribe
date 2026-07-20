@@ -48,6 +48,32 @@ describe('ONNX detection decoder', () => {
     expect(boxes[0]).toMatchObject({ classId: 0, score: expect.closeTo(.72, 4) });
   });
 
+  it('applies objectness for a one-class YOLOv5 export when the dataset has exactly two classes', () => {
+    const values = new Float32Array(2000 * 6);
+    values.set([100, 100, 20, 20, .8, .9], 0);
+    const boxes = decodeDetections({ dims: [1, 2000, 6], data: values }, 2, .5, meta);
+    expect(boxes).toHaveLength(1);
+    expect(boxes[0]).toMatchObject({ classId: 0, score: expect.closeTo(.72, 4), x: 90, y: 90 });
+  });
+
+  it('keeps YOLO layout for a row whose class score saturates to an exact integer', () => {
+    const values = new Float32Array(2000 * 6);
+    values.set([100, 100, 20, 20, .8, 1], 0);
+    values.set([300, 300, 40, 40, .7, .93], 6);
+    const boxes = decodeDetections({ dims: [1, 2000, 6], data: values }, 1, .5, meta);
+    expect(boxes).toHaveLength(2);
+    expect(boxes[0]).toMatchObject({ classId: 0, score: expect.closeTo(.8, 4), x: 90, y: 90 });
+    expect(boxes).toContainEqual(expect.objectContaining({ x: 280, y: 280 }));
+  });
+
+  it('decodes an end-to-end output row-major even with only five detections', () => {
+    const values = new Float32Array(5 * 6);
+    for (let row = 0; row < 5; row++) values.set([row * 100, 20, row * 100 + 50, 80, .9, row % 3], row * 6);
+    const boxes = decodeDetections({ dims: [1, 5, 6], data: values }, 3, .5, meta);
+    expect(boxes).toHaveLength(5);
+    expect(boxes).toContainEqual(expect.objectContaining({ classId: 1, x: 100, y: 20, width: 50, height: 60 }));
+  });
+
   it('decodes end-to-end xyxy detections', () => {
     const output = { dims: [1, 1, 6], data: new Float32Array([10, 20, 110, 220, .75, 1]) };
     expect(decodeDetections(output, 3, .5, meta)[0]).toMatchObject({ classId: 1, x: 10, y: 20, width: 100, height: 200 });
