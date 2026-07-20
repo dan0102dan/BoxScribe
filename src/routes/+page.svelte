@@ -9,7 +9,7 @@
   import Icon from '$lib/components/Icon.svelte';
   import { BoxHistory } from '$lib/annotation/history';
   import { serializeYolo } from '$lib/annotation/yolo';
-  import { detectOnnx, isOnnxSessionCached, mergeDetections, type Detection } from '$lib/detection/onnx';
+  import { detectOnnx, mergeDetections, openFrame, type Detection, type DetectionFrame } from '$lib/detection/onnx';
   import { shortcuts } from '$lib/config/shortcuts';
   import type { BoundingBox, ProjectState } from '$lib/annotation/types';
   import { boxesByImage, project as generatedProject } from '$lib/generated/dataset';
@@ -40,13 +40,8 @@
   let modelsDirectory = '';
   let detectionConfidence = 0.25;
   let detectionMode: 'replace' | 'append' = 'replace';
-  let detecting = false;
-  let detectionMessage = '';
-  let detectionError = '';
-  let detectionBackend: 'webgpu' | 'wasm' | '' = '';
-  let detectionMetrics = '';
-  let detectionRunAll = false;
-  let detectionProgress = '';
+  let detectionRun: { all: boolean; progress: string } | null = null;
+  let detectionStatus: { error?: string; message?: string; metrics?: string } | null = null;
   let canvas: AnnotationCanvas;
   let autosaveTimer: ReturnType<typeof setTimeout>;
   let searchTimer: ReturnType<typeof setTimeout>;
@@ -65,6 +60,8 @@
     const matchesClass = runtimeDataset || classFilters.every((classId) => imageBoxes.some((box) => box.classId === classId));
     return matchesSearch && matchesFilter && matchesClass;
   });
+  $: detecting = detectionRun !== null;
+  $: detectionDisabled = detecting || !currentImage || Boolean(currentImage?.excluded);
   $: selectedBox = boxes.find((box) => box.id === selectedId) ?? null;
   $: selectedBoxNumber = selectedBox ? boxes.findIndex((box) => box.id === selectedBox.id) + 1 : 0;
   $: totalImages = project.totalImages ?? project.images.length;
@@ -444,34 +441,34 @@
       modelsDirectory = body.directory;
       const remembered = localStorage.getItem('boxscribe:detection-model');
       selectedModel = detectionModels.some((model) => model.id === remembered) ? remembered! : detectionModels[0]?.id ?? '';
-    } catch (error) { detectionError = error instanceof Error ? error.message : 'Не удалось найти ONNX-модели'; }
+    } catch (error) { detectionStatus = { error: error instanceof Error ? error.message : 'Не удалось найти ONNX-модели' }; }
   }
 
   async function runDetection(runAll = false) {
-    if (!currentImage || !selectedModel || detecting || currentImage.excluded) return;
+    if (!currentImage || !selectedModel || detectionRun || currentImage.excluded) return;
     // An emptied number input binds null, which would disable the threshold entirely.
     detectionConfidence = Number.isFinite(detectionConfidence) ? Math.min(1, Math.max(0, detectionConfidence)) : 0.25;
     const targetId = currentImage.id;
     const selected = detectionModels.find((candidate) => candidate.id === selectedModel);
-    const models = runAll
-      ? [...detectionModels].sort((a, b) => Number(isOnnxSessionCached(`/__boxscribe/model?name=${encodeURIComponent(b.id)}`)) - Number(isOnnxSessionCached(`/__boxscribe/model?name=${encodeURIComponent(a.id)}`)))
-      : selected ? [selected] : [];
+    const models = runAll ? detectionModels : selected ? [selected] : [];
     if (!models.length) return;
-    detecting = true; detectionRunAll = runAll; detectionProgress = ''; detectionError = ''; detectionMessage = ''; detectionMetrics = '';
+    detectionRun = { all: runAll, progress: '' };
+    detectionStatus = null;
     localStorage.setItem('boxscribe:detection-model', selectedModel);
+    let frame: DetectionFrame | null = null;
     try {
       const combined: Detection[] = [];
       let bestScore = 0, inferenceMs = 0, totalMs = 0, sessionMs = 0, unmatched = 0;
-      const inputSizes = new Set<string>(), backends = new Set<'webgpu' | 'wasm'>();
+      const inputSizes = new Set<string>(), backends = new Set<string>();
+      frame = await openFrame(frameUrl(currentImage));
       for (let index = 0; index < models.length; index++) {
         const model = models[index];
-        detectionProgress = runAll ? `${index + 1}/${models.length}` : '';
+        detectionRun = { all: runAll, progress: runAll ? `${index + 1}/${models.length}` : '' };
         const modelClasses = model.classes?.length ? model.classes : project.classes;
-        const modelUrl = `/__boxscribe/model?name=${encodeURIComponent(model.id)}`;
-        const result = await detectOnnx(modelUrl, frameUrl(currentImage), modelClasses.length, detectionConfidence);
+        const result = await detectOnnx(`/__boxscribe/model?name=${encodeURIComponent(model.id)}`, frame, modelClasses.length, detectionConfidence);
         if (currentId !== targetId) return;
         bestScore = Math.max(bestScore, result.bestScore); inferenceMs += result.timings.inference; totalMs += result.timings.total; sessionMs += result.timings.session;
-        inputSizes.add(result.inputSize); backends.add(result.backend);
+        inputSizes.add(result.inputSize); backends.add(result.backend.toUpperCase());
         combined.push(...result.detections.flatMap((box) => {
           const modelClassName = modelClasses[box.classId];
           const mappedClass = project.classes.findIndex((className) => className.toLowerCase() === modelClassName?.toLowerCase());
@@ -487,22 +484,23 @@
       const next = mergeDetections([...existing, ...combined], 0.5)
         .filter((detection) => Number.isFinite(detection.score))
         .map(({ score, ...box }) => ({ ...box, confidence: score, id: crypto.randomUUID() }));
-      detectionBackend = backends.size === 1 ? [...backends][0] : '';
       if (next.length) {
         history.push(boxes);
         boxes = detectionMode === 'append' ? [...boxes, ...next] : next;
         selectedId = null; markDirty();
       }
       const dropped = unmatched ? ` · без совпадения классов: ${unmatched}` : '';
-      detectionMessage = next.length
-        ? `${runAll ? `Ансамбль ${models.length} моделей` : 'Найдено'}: ${next.length}${dropped}`
-        : bestScore > 0
-          ? `Ничего выше ${formatConfidence(detectionConfidence)} · лучший кандидат ${formatConfidence(bestScore)}${dropped}`
-          : `Кандидаты не найдены${dropped}`;
       const seconds = (value: number) => value < 1000 ? `${Math.round(value)} мс` : `${(value / 1000).toFixed(1)} с`;
-      detectionMetrics = `${[...inputSizes].join(', ')} · инференс ${seconds(inferenceMs)} · всего ${seconds(totalMs)}${sessionMs > 500 ? ` · запуск ${seconds(sessionMs)}` : ''}`;
-    } catch (error) { detectionError = error instanceof Error ? error.message : 'Ошибка ONNX-детекции'; }
-    finally { detecting = false; detectionRunAll = false; detectionProgress = ''; }
+      detectionStatus = {
+        message: next.length
+          ? `${runAll ? `Ансамбль ${models.length} моделей` : 'Найдено'}: ${next.length}${dropped}`
+          : bestScore > 0
+            ? `Ничего выше ${formatConfidence(detectionConfidence)} · лучший кандидат ${formatConfidence(bestScore)}${dropped}`
+            : `Кандидаты не найдены${dropped}`,
+        metrics: `${[...inputSizes].join(', ')} · ${[...backends].join('+')} · инференс ${seconds(inferenceMs)} · всего ${seconds(totalMs)}${sessionMs > 500 ? ` · запуск ${seconds(sessionMs)}` : ''}`
+      };
+    } catch (error) { detectionStatus = { error: error instanceof Error ? error.message : 'Ошибка ONNX-детекции' }; }
+    finally { frame?.close(); detectionRun = null; }
   }
 
   function keyHandler(event: KeyboardEvent) {
@@ -587,20 +585,20 @@
       {#if loadingFrame}<div class="frame-loading" role="status" aria-live="polite"><div><i class="spinner"></i><span>Загрузка кадра</span><small>{loadingFrame.name}</small></div></div>{/if}
     </section>
     <aside class="inspector">
-      <div class="panel-head assistant-head"><span>ONNX-помощник</span><small>{detectionBackend ? detectionBackend.toUpperCase() : detectionModels.length ? `${detectionModels.length} ${detectionModels.length === 1 ? 'MODEL' : 'MODELS'}` : 'AUTO'}</small></div>
+      <div class="panel-head assistant-head"><span>ONNX-помощник</span><small>{detectionModels.length ? `${detectionModels.length} ${detectionModels.length === 1 ? 'MODEL' : 'MODELS'}` : 'AUTO'}</small></div>
       <div class="assistant-panel">
         {#if detectionModels.length}
           <select bind:value={selectedModel} aria-label="ONNX-модель">{#each detectionModels as model}<option value={model.id}>{model.name}</option>{/each}</select>
           <label class="confidence"><span>CONF</span><input type="range" min="0" max="1" step="0.01" bind:value={detectionConfidence}/><input class="confidence-value" aria-label="Порог confidence" type="number" min="0" max="1" step="0.01" bind:value={detectionConfidence}/></label>
           <div class="assistant-actions">
             <div class="detection-mode"><button title="Заменить текущие bbox" class:active={detectionMode === 'replace'} on:click={() => detectionMode = 'replace'}>Заменить</button><button title="Добавить к текущим bbox" class:active={detectionMode === 'append'} on:click={() => detectionMode = 'append'}>Добавить</button></div>
-            <button class="detect-btn" on:click={() => runDetection(false)} disabled={detecting || !currentImage || Boolean(currentImage?.excluded)} title="Запустить выбранную модель" aria-label="Запустить выбранную модель">{#if detecting && !detectionRunAll}<i class="spinner"></i>{:else}<Icon name="play" size={14}/>{/if}</button>
-            <button class="detect-btn detect-all" on:click={() => runDetection(true)} disabled={detecting || detectionModels.length < 2 || !currentImage || Boolean(currentImage?.excluded)} title="Запустить все модели и объединить bbox (R)" aria-label="Запустить все модели">{#if detecting && detectionRunAll}<i class="spinner"></i><span>{detectionProgress}</span>{:else}<Icon name="play-all" size={14}/>{/if}</button>
+            <button class="detect-btn" on:click={() => runDetection(false)} disabled={detectionDisabled} title="Запустить выбранную модель" aria-label="Запустить выбранную модель">{#if detectionRun && !detectionRun.all}<i class="spinner"></i>{:else}<Icon name="play" size={14}/>{/if}</button>
+            <button class="detect-btn detect-all" on:click={() => runDetection(true)} disabled={detectionDisabled || detectionModels.length < 2} title="Запустить все модели и объединить bbox (R)" aria-label="Запустить все модели">{#if detectionRun?.all}<i class="spinner"></i><span>{detectionRun.progress}</span>{:else}<Icon name="play-all" size={14}/>{/if}</button>
           </div>
         {:else}
           <p class="model-empty">Положите файлы <b>.onnx</b> в<br/><code title={modelsDirectory}>{modelsDirectory || 'models'}</code><br/>и обновите страницу.</p>
         {/if}
-        {#if detectionError}<p class="detection-status error">{detectionError}</p>{:else if detectionMessage}<p class="detection-status"><b>{detectionMessage}</b><span>{detectionMetrics}</span></p>{/if}
+        {#if detectionStatus?.error}<p class="detection-status error">{detectionStatus.error}</p>{:else if detectionStatus?.message}<p class="detection-status"><b>{detectionStatus.message}</b><span>{detectionStatus.metrics}</span></p>{/if}
       </div>
       <div class="panel-head class-mode"><span>{selectedBox ? 'Класс выбранного bbox' : 'Класс нового bbox'}</span><small>{selectedBox ? 'EDIT' : 'DRAW'}</small></div>
       <div class="class-list">

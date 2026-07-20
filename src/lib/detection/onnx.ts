@@ -9,10 +9,6 @@ type DecodeStats = { bestScore: number };
 
 type LoadedSession = { session: import('onnxruntime-web').InferenceSession; backend: 'webgpu' | 'wasm' };
 const sessions = new Map<string, Promise<LoadedSession>>();
-// Each retained session keeps the whole model plus runtime workspace in memory
-// (hundreds of MB for the bundled weights); an unbounded cache gets the tab
-// killed by Safari's memory watchdog.
-const maxCachedSessions = 2;
 
 function iou(a: Detection, b: Detection) {
   const left = Math.max(a.x, b.x), top = Math.max(a.y, b.y);
@@ -99,21 +95,21 @@ export function decodeDetections(output: TensorLike, classCount: number, confide
   return mergeDetections(result);
 }
 
-async function loadSession(url: string) {
+function loadSession(url: string) {
   let pending = sessions.get(url);
-  if (pending) {
-    // Refresh insertion order so the first map entry is always the LRU session.
-    sessions.delete(url); sessions.set(url, pending);
-  }
   if (!pending) {
-    while (sessions.size >= maxCachedSessions) await releaseOnnxSession(sessions.keys().next().value!);
     pending = import('onnxruntime-web').then(async ({ env, InferenceSession }) => {
       env.wasm.wasmPaths = { wasm: new URL(wasmUrl, window.location.href).href };
+      // Sessions are retained for reuse across runs, so the per-session memory
+      // arena stays off: an arena would hold every session's activation peak
+      // forever (hundreds of MB each at large input sizes), while plain
+      // allocations are returned to the shared heap after every run.
+      const options = { enableCpuMemArena: false, enableMemPattern: false };
       if ('gpu' in navigator) {
-        try { return { session: await InferenceSession.create(url, { executionProviders: ['webgpu'] }), backend: 'webgpu' as const }; }
+        try { return { session: await InferenceSession.create(url, { ...options, executionProviders: ['webgpu'] }), backend: 'webgpu' as const }; }
         catch (error) { console.warn('WebGPU недоступен для этой ONNX-модели, используется WASM.', error); }
       }
-      return { session: await InferenceSession.create(url, { executionProviders: ['wasm'] }), backend: 'wasm' as const };
+      return { session: await InferenceSession.create(url, { ...options, executionProviders: ['wasm'] }), backend: 'wasm' as const };
     });
     sessions.set(url, pending);
     pending.catch(() => sessions.delete(url));
@@ -121,45 +117,53 @@ async function loadSession(url: string) {
   return pending;
 }
 
-export async function releaseOnnxSession(url: string) {
-  const pending = sessions.get(url);
-  if (!pending) return;
-  sessions.delete(url);
-  try { const { session } = await pending; await session.release(); }
-  catch { /* A failed/partially-created session has nothing reliable to release. */ }
+/** Fetches and decodes a frame once, so every model in a run shares the pixels. */
+export async function openFrame(imageUrl: string) {
+  const response = await fetch(imageUrl);
+  if (!response.ok) throw new Error('Не удалось загрузить изображение для детекции');
+  const bitmap = await createImageBitmap(await response.blob());
+  const planes = new Map<string, { chw: Float32Array; meta: Letterbox }>();
+  return {
+    /** Letterboxed CHW input, cached per model input size for the frame's lifetime. */
+    tensorFor(inputWidth: number, inputHeight: number) {
+      const key = `${inputWidth}×${inputHeight}`;
+      const cached = planes.get(key);
+      if (cached) return cached;
+      const scale = Math.min(inputWidth / bitmap.width, inputHeight / bitmap.height);
+      const drawWidth = Math.round(bitmap.width * scale), drawHeight = Math.round(bitmap.height * scale);
+      const padX = Math.floor((inputWidth - drawWidth) / 2), padY = Math.floor((inputHeight - drawHeight) / 2);
+      const canvas = document.createElement('canvas'); canvas.width = inputWidth; canvas.height = inputHeight;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      if (!context) throw new Error('Canvas недоступен для подготовки изображения');
+      context.fillStyle = 'rgb(114,114,114)'; context.fillRect(0, 0, inputWidth, inputHeight);
+      context.drawImage(bitmap, padX, padY, drawWidth, drawHeight);
+      const rgba = context.getImageData(0, 0, inputWidth, inputHeight).data;
+      const plane = inputWidth * inputHeight, chw = new Float32Array(plane * 3);
+      for (let index = 0; index < plane; index++) {
+        chw[index] = rgba[index * 4] / 255;
+        chw[plane + index] = rgba[index * 4 + 1] / 255;
+        chw[plane * 2 + index] = rgba[index * 4 + 2] / 255;
+      }
+      const prepared = { chw, meta: { scale, padX, padY, imageWidth: bitmap.width, imageHeight: bitmap.height, inputWidth, inputHeight } };
+      planes.set(key, prepared);
+      return prepared;
+    },
+    close() { bitmap.close(); planes.clear(); }
+  };
 }
 
-export function isOnnxSessionCached(url: string) { return sessions.has(url); }
+export type DetectionFrame = Awaited<ReturnType<typeof openFrame>>;
 
-export async function detectOnnx(modelUrl: string, imageUrl: string, classCount: number, confidence: number) {
+export async function detectOnnx(modelUrl: string, frame: DetectionFrame, classCount: number, confidence: number) {
   const startedAt = performance.now();
-  const { session, backend } = await loadSession(modelUrl);
+  const [{ session, backend }, { Tensor }] = await Promise.all([loadSession(modelUrl), import('onnxruntime-web')]);
   const sessionReadyAt = performance.now();
   const metadata = session.inputMetadata[0];
   if (!metadata || !('shape' in metadata)) throw new Error('У модели нет тензорного входа');
   const shape = metadata.shape;
   const inputHeight = typeof shape[2] === 'number' && shape[2] > 0 ? shape[2] : 640;
   const inputWidth = typeof shape[3] === 'number' && shape[3] > 0 ? shape[3] : 640;
-  const response = await fetch(imageUrl);
-  if (!response.ok) throw new Error('Не удалось загрузить изображение для детекции');
-  const bitmap = await createImageBitmap(await response.blob());
-  const imageWidth = bitmap.width, imageHeight = bitmap.height;
-  const scale = Math.min(inputWidth / bitmap.width, inputHeight / bitmap.height);
-  const drawWidth = Math.round(bitmap.width * scale), drawHeight = Math.round(bitmap.height * scale);
-  const padX = Math.floor((inputWidth - drawWidth) / 2), padY = Math.floor((inputHeight - drawHeight) / 2);
-  const canvas = document.createElement('canvas'); canvas.width = inputWidth; canvas.height = inputHeight;
-  const context = canvas.getContext('2d', { willReadFrequently: true });
-  if (!context) throw new Error('Canvas недоступен для подготовки изображения');
-  context.fillStyle = 'rgb(114,114,114)'; context.fillRect(0, 0, inputWidth, inputHeight);
-  context.drawImage(bitmap, padX, padY, drawWidth, drawHeight); bitmap.close();
-  const rgba = context.getImageData(0, 0, inputWidth, inputHeight).data;
-  const plane = inputWidth * inputHeight, chw = new Float32Array(plane * 3);
-  for (let index = 0; index < plane; index++) {
-    chw[index] = rgba[index * 4] / 255;
-    chw[plane + index] = rgba[index * 4 + 1] / 255;
-    chw[plane * 2 + index] = rgba[index * 4 + 2] / 255;
-  }
-  const { Tensor } = await import('onnxruntime-web');
+  const { chw, meta } = frame.tensorFor(inputWidth, inputHeight);
   const preprocessedAt = performance.now();
   const inputTensor = new Tensor('float32', chw, [1, 3, inputHeight, inputWidth]);
   let outputs: Awaited<ReturnType<typeof session.run>>;
@@ -170,7 +174,7 @@ export async function detectOnnx(modelUrl: string, imageUrl: string, classCount:
   let detections: Detection[], stats: DecodeStats = { bestScore: 0 };
   try {
     if (!output || !('dims' in output) || !('data' in output)) throw new Error('Модель не вернула тензор детекций');
-    detections = decodeDetections(output as TensorLike, classCount, confidence, { scale, padX, padY, imageWidth, imageHeight, inputWidth, inputHeight }, stats);
+    detections = decodeDetections(output as TensorLike, classCount, confidence, meta, stats);
   } finally {
     for (const value of Object.values(outputs)) if ('dispose' in value && typeof value.dispose === 'function') value.dispose();
   }
