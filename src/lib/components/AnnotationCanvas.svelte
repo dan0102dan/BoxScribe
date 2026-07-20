@@ -29,6 +29,8 @@
   let fittedDims = '';
   let viewport: Viewport = { scale: 1, offsetX: 0, offsetY: 0 };
   let spaceDown = false;
+  let cursor = 'crosshair';
+  let lastPointer: { x: number; y: number } | null = null;
   let action: null | { type: 'pan' | 'create' | 'move' | 'resize'; startX: number; startY: number; before: BoundingBox[]; box?: BoundingBox; handle?: string; startViewport?: Viewport } = null;
   const palette = ['#E9FF70', '#FF8D5C', '#70D6FF', '#D7A7FF', '#77E6A1', '#FFD166', '#FF7A9E', '#B8C0FF', '#F3A6FF'];
 
@@ -143,7 +145,9 @@
     ctx.fillStyle = `${color}${selected ? '1f' : '0d'}`;
     ctx.fillRect(p.x, p.y, w, h); ctx.strokeRect(p.x, p.y, w, h);
     if (showLabels) {
-      const label = classes[box.classId] ?? `class ${box.classId}`;
+      const classLabel = classes[box.classId] ?? `class ${box.classId}`;
+      const confidence = box.confidence === undefined ? '' : box.confidence < 0.01 ? box.confidence.toFixed(4) : box.confidence.toFixed(2);
+      const label = confidence ? `${classLabel} · ${confidence}` : classLabel;
       ctx.font = '600 12px Inter, system-ui';
       const labelWidth = ctx.measureText(label).width + 14;
       ctx.fillStyle = color; ctx.fillRect(p.x, Math.max(0, p.y - 22), labelWidth, 22);
@@ -169,7 +173,29 @@
     const box = boxes.find((b) => b.id === selectedId); if (!box) return null;
     const names = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
     const index = handles(box).findIndex(([hx, hy]) => Math.abs(x - hx) <= 8 && Math.abs(y - hy) <= 8);
-    return index >= 0 ? names[index] : null;
+    if (index >= 0) return names[index];
+    const a = imageToScreen(box.x, box.y, viewport), b = imageToScreen(box.x + box.width, box.y + box.height, viewport);
+    const tolerance = 5, withinX = x >= a.x && x <= b.x, withinY = y >= a.y && y <= b.y;
+    if (withinX && Math.abs(y - a.y) <= tolerance) return 'n';
+    if (withinX && Math.abs(y - b.y) <= tolerance) return 's';
+    if (withinY && Math.abs(x - a.x) <= tolerance) return 'w';
+    if (withinY && Math.abs(x - b.x) <= tolerance) return 'e';
+    return null;
+  }
+
+  function resizeCursor(handle: string) {
+    if (handle === 'n' || handle === 's') return 'ns-resize';
+    if (handle === 'e' || handle === 'w') return 'ew-resize';
+    if (handle === 'ne' || handle === 'sw') return 'nesw-resize';
+    return 'nwse-resize';
+  }
+
+  function updateIdleCursor() {
+    if (spaceDown) { cursor = 'grab'; return; }
+    if (!lastPointer) { cursor = 'crosshair'; return; }
+    const handle = selectedHandle(lastPointer.x, lastPointer.y);
+    if (!readOnly && handle) { cursor = resizeCursor(handle); return; }
+    cursor = !readOnly && hitBox(lastPointer.x, lastPointer.y) ? 'move' : 'crosshair';
   }
 
   function hitBox(x: number, y: number) {
@@ -180,19 +206,20 @@
   function pointerDown(event: PointerEvent) {
     canvas.setPointerCapture(event.pointerId);
     const p = point(event), before = boxes.map((b) => ({ ...b }));
+    lastPointer = p;
     if (spaceDown || event.button === 1) {
-      action = { type: 'pan', startX: p.x, startY: p.y, before, startViewport: { ...viewport } }; return;
+      action = { type: 'pan', startX: p.x, startY: p.y, before, startViewport: { ...viewport } }; cursor = 'grabbing'; return;
     }
     if (readOnly) { dispatch('select', hitBox(p.x, p.y)?.id ?? null); return; }
     const handle = selectedHandle(p.x, p.y);
     if (handle) {
       const box = boxes.find((b) => b.id === selectedId)!;
-      action = { type: 'resize', startX: p.x, startY: p.y, before, box: { ...box }, handle }; return;
+      action = { type: 'resize', startX: p.x, startY: p.y, before, box: { ...box }, handle }; cursor = resizeCursor(handle); return;
     }
     const hit = hitBox(p.x, p.y);
     if (hit) {
       dispatch('select', hit.id);
-      action = { type: 'move', startX: p.x, startY: p.y, before, box: { ...hit } }; return;
+      action = { type: 'move', startX: p.x, startY: p.y, before, box: { ...hit } }; cursor = 'move'; return;
     }
     const ip = screenToImage(p.x, p.y, viewport);
     if (ip.x < 0 || ip.y < 0 || ip.x > imageInfo.width || ip.y > imageInfo.height) { dispatch('select', null); return; }
@@ -203,8 +230,9 @@
   }
 
   function pointerMove(event: PointerEvent) {
-    if (!action) return;
     const p = point(event);
+    lastPointer = p;
+    if (!action) { updateIdleCursor(); return; }
     if (action.type === 'pan') {
       viewport = { ...viewport, offsetX: action.startViewport!.offsetX + p.x - action.startX, offsetY: action.startViewport!.offsetY + p.y - action.startY };
       draw(); return;
@@ -230,7 +258,7 @@
     dispatch('change', boxes.map((b) => b.id === next.id ? next : b));
   }
 
-  function pointerUp() {
+  function pointerUp(event: PointerEvent) {
     if (!action) return;
     if (action.type !== 'pan') {
       let finalBoxes = boxes;
@@ -239,6 +267,7 @@
       dispatch('commit', { before: action.before, boxes: finalBoxes });
     }
     action = null;
+    lastPointer = point(event); updateIdleCursor();
   }
 
   function wheel(event: WheelEvent) {
@@ -247,11 +276,11 @@
     const before = screenToImage(p.x, p.y, viewport);
     const scale = clamp(viewport.scale * Math.exp(-event.deltaY * 0.0012), 0.04, 20);
     viewport = { scale, offsetX: p.x - before.x * scale, offsetY: p.y - before.y * scale };
-    dispatch('viewport', Math.round(scale * 100)); draw();
+    dispatch('viewport', Math.round(scale * 100)); draw(); updateIdleCursor();
   }
 
-  function keyDown(event: KeyboardEvent) { if (event.code === 'Space') spaceDown = true; }
-  function keyUp(event: KeyboardEvent) { if (event.code === 'Space') spaceDown = false; }
+  function keyDown(event: KeyboardEvent) { if (event.code === 'Space') { spaceDown = true; cursor = action?.type === 'pan' ? 'grabbing' : 'grab'; } }
+  function keyUp(event: KeyboardEvent) { if (event.code === 'Space') { spaceDown = false; updateIdleCursor(); } }
 
   onMount(() => {
     const observer = new ResizeObserver(resize); observer.observe(host); resize();
@@ -261,7 +290,7 @@
 </script>
 
 <div class:grabbing={action?.type === 'pan'} class:space={spaceDown} class="canvas-host" bind:this={host}>
-  <canvas bind:this={canvas} on:pointerdown={pointerDown} on:pointermove={pointerMove} on:pointerup={pointerUp} on:pointercancel={pointerUp} on:wheel={wheel}></canvas>
+  <canvas bind:this={canvas} style:cursor={cursor} on:pointerdown={pointerDown} on:pointermove={pointerMove} on:pointerup={pointerUp} on:pointercancel={pointerUp} on:wheel|nonpassive={wheel}></canvas>
 </div>
 
 <style>

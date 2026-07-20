@@ -4,6 +4,7 @@ export const shortcuts = {
   save: ['s'],
   fit: ['f'],
   focus: ['b'],
+  detectAll: ['r'],
   undo: ['z'],
   redo: ['y'],
   previousClass: ['['],

@@ -7,3 +7,6 @@ build
 .boxscribe
 static/dataset
 *.log
+
+models/*.onnx
+!models/yolov5m.onnx

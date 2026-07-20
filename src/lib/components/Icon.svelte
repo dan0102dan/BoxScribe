@@ -1,5 +1,5 @@
 <script lang="ts">
-  export let name: 'logo' | 'folder' | 'save' | 'undo' | 'redo' | 'fit' | 'focus' | 'eye' | 'trash' | 'restore' | 'chevron' | 'search' | 'image' | 'check' | 'warning';
+  export let name: 'logo' | 'folder' | 'save' | 'undo' | 'redo' | 'fit' | 'focus' | 'eye' | 'trash' | 'restore' | 'chevron' | 'search' | 'image' | 'check' | 'warning' | 'play' | 'play-all';
   export let size = 18;
 </script>
 
@@ -19,5 +19,7 @@
   {:else if name === 'image'}<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m4 17 5-5 4 4 2-2 5 5"/>
   {:else if name === 'check'}<path d="m5 12 4 4L19 6"/>
   {:else if name === 'warning'}<path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/>
+  {:else if name === 'play'}<path d="m8 5 11 7-11 7Z"/>
+  {:else if name === 'play-all'}<path d="m4 6 8 6-8 6Z"/><path d="m12 6 8 6-8 6Z"/>
   {/if}
 </svg>

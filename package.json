@@ -30,6 +30,7 @@
   "dependencies": {
     "image-size": "^2.0.2",
     "jszip": "^3.10.1",
+    "onnxruntime-web": "^1.27.0",
     "yaml": "^2.8.1"
   }
 }

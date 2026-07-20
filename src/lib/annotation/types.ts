@@ -1,6 +1,8 @@
 export interface BoundingBox {
   id: string;
   classId: number;
+  /** Confidence of an automatically detected box, from 0 to 1. */
+  confidence?: number;
   x: number;
   y: number;
   width: number;

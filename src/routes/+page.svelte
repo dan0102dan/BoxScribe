@@ -1,18 +1,22 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { browser } from '$app/environment';
+  import { pushState, replaceState } from '$app/navigation';
   import { base } from '$app/paths';
+  import { page } from '$app/stores';
   import JSZip from 'jszip';
   import AnnotationCanvas from '$lib/components/AnnotationCanvas.svelte';
   import Icon from '$lib/components/Icon.svelte';
   import { BoxHistory } from '$lib/annotation/history';
   import { serializeYolo } from '$lib/annotation/yolo';
+  import { detectOnnx, mergeDetections, openFrame, type Detection, type DetectionFrame } from '$lib/detection/onnx';
   import { shortcuts } from '$lib/config/shortcuts';
   import type { BoundingBox, ProjectState } from '$lib/annotation/types';
   import { boxesByImage, project as generatedProject } from '$lib/generated/dataset';
 
-  let project: ProjectState = generatedProject;
   const runtimeDataset = import.meta.env.DEV;
-  let currentId: string | null = project?.lastImageId ?? project?.images[0]?.id ?? null;
+  let project: ProjectState = generatedProject;
+  let currentId: string | null = runtimeDataset ? null : project?.lastImageId ?? project?.images[0]?.id ?? null;
   let boxes: BoundingBox[] = [];
   let selectedId: string | null = null;
   let focusedId: string | null = null;
@@ -31,11 +35,19 @@
   let filteringClasses = false;
   let showLabels = true;
   let zoom = 100;
+  let detectionModels: Array<{ id: string; name: string; classes: string[] }> = [];
+  let selectedModel = '';
+  let modelsDirectory = '';
+  let detectionConfidence = 0.25;
+  let detectionMode: 'replace' | 'append' = 'replace';
+  let detectionRun: { all: boolean; progress: string } | null = null;
+  let detectionStatus: { error?: string; message?: string; metrics?: string } | null = null;
   let canvas: AnnotationCanvas;
   let autosaveTimer: ReturnType<typeof setTimeout>;
   let searchTimer: ReturnType<typeof setTimeout>;
   let imageList: HTMLDivElement;
   let revealedId: string | null = null;
+  let routeReady = false;
   const frameCache = new Map<string, Promise<{ boxes: BoundingBox[]; image: typeof project.images[number]; saved: boolean }>>();
   const history = new BoxHistory();
 
@@ -48,6 +60,8 @@
     const matchesClass = runtimeDataset || classFilters.every((classId) => imageBoxes.some((box) => box.classId === classId));
     return matchesSearch && matchesFilter && matchesClass;
   });
+  $: detecting = detectionRun !== null;
+  $: detectionDisabled = detecting || !currentImage || Boolean(currentImage?.excluded);
   $: selectedBox = boxes.find((box) => box.id === selectedId) ?? null;
   $: selectedBoxNumber = selectedBox ? boxes.findIndex((box) => box.id === selectedBox.id) + 1 : 0;
   $: totalImages = project.totalImages ?? project.images.length;
@@ -64,6 +78,45 @@
   }
 
   const formatCount = (value: number) => new Intl.NumberFormat('ru-RU').format(value);
+  const formatConfidence = (value: number) => value < 0.01 ? value.toFixed(4) : value.toFixed(2);
+
+  // The visible frame owns the URL: openImage records it through SvelteKit's
+  // shallow routing, and the $page watcher below follows Back/Forward.
+  function syncFrameRoute(id: string) {
+    const url = new URL(window.location.href);
+    const previous = url.searchParams.get('frame');
+    if (previous === id) return;
+    url.searchParams.set('frame', id);
+    // Push only over a frame that actually resolved, so Back never lands on a
+    // dead entry (first open and unknown ids are replaced instead).
+    const navigate = previous && project.images.some((image) => image.id === previous) ? pushState : replaceState;
+    navigate(url, { frame: id });
+  }
+
+  function mergeFrame(image: typeof project.images[number]) {
+    if (!project.images.some((candidate) => candidate.id === image.id)) {
+      project = { ...project, images: [...project.images, image].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
+    }
+    return image;
+  }
+
+  async function resolveFrameTarget(id: string) {
+    const known = project.images.find((image) => image.id === id);
+    if (known || !runtimeDataset) return known ?? null;
+    const response = await fetch(`/__boxscribe/item?id=${encodeURIComponent(id)}`);
+    return response.ok ? mergeFrame(await response.json()) : null;
+  }
+
+  async function followFrameRoute(id: string) {
+    if (id === currentId) return;
+    const target = await resolveFrameTarget(id);
+    if (target) await openImage(target.id);
+  }
+
+  // Shallow navigation carries the frame in $page.state; $page.url only moves
+  // on real navigations (initial load, reload), where it is the source instead.
+  $: routedFrame = browser ? $page.state.frame ?? $page.url.searchParams.get('frame') : null;
+  $: if (routeReady && routedFrame) void followFrameRoute(routedFrame);
 
   function runtimeScope() {
     return { query: search, status: filter === 'excluded' ? 'excluded' : 'active', classIds: classFilters };
@@ -76,7 +129,7 @@
     return params;
   }
 
-  async function loadRuntimeProject(query = '', preferredImage: typeof project.images[number] | null = null) {
+  async function loadRuntimeProject(query = '', preferredImage: typeof project.images[number] | null = null, preferredId: string | null = null) {
     saveError = '';
     try {
       const response = await fetch(`/__boxscribe/project?${runtimeParams({ limit: 200, query })}`);
@@ -84,10 +137,9 @@
       if (!response.ok) throw new Error(body.message);
       project = body;
       currentId = null;
-      if (preferredImage && !project.images.some((image) => image.id === preferredImage.id)) {
-        project = { ...project, images: [...project.images, preferredImage].sort((a, b) => (a.index ?? 0) - (b.index ?? 0)) };
-      }
-      const target = preferredImage ?? body.images[0] ?? null;
+      const target = (preferredImage ? mergeFrame(preferredImage) : null)
+        ?? (preferredId ? await resolveFrameTarget(preferredId) : null)
+        ?? body.images[0] ?? null;
       if (target) await openImage(target.id);
     } catch (error) { saveError = error instanceof Error ? error.message : 'Не удалось открыть датасет'; }
   }
@@ -218,11 +270,13 @@
         currentId = id; boxes = body.boxes; selectedId = null; dirty = false; history.reset(); savedAt = body.saved ? 'Из YOLO TXT' : '';
         project = { ...project, images: project.images.map((image) => image.id === id ? body.image : image) };
         localStorage.setItem('boxscribe:last-image', id);
+        syncFrameRoute(id);
         void preloadNeighbor(target, -1); void preloadNeighbor(target, 1);
       } else {
         awaitingCanvas = true;
         currentId = id;
         await loadAnnotations();
+        syncFrameRoute(id);
       }
     } catch (error) {
       if (request === frameRequestSequence) saveError = error instanceof Error ? error.message : 'Ошибка загрузки';
@@ -314,6 +368,11 @@
     markDirty();
   }
 
+  function clearAllBoxes() {
+    if (!boxes.length || currentImage?.excluded) return;
+    history.push(boxes); boxes = []; selectedId = null; focusedId = null; markDirty();
+  }
+
   function changeSelectedClass(classId: number) {
     currentClass = classId;
     if (!selectedId || currentImage?.excluded) return;
@@ -326,6 +385,7 @@
     selectedId = id;
     const box = boxes.find((item) => item.id === id);
     if (box) currentClass = box.classId;
+    if (id) void tick().then(() => document.querySelector('.box-list button.active')?.scrollIntoView({ block: 'nearest' }));
   }
 
   async function focusCurrent() {
@@ -371,6 +431,78 @@
     finally { exporting = false; }
   }
 
+  async function loadDetectionModels() {
+    if (!runtimeDataset) return;
+    try {
+      const response = await fetch('/__boxscribe/models');
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.message);
+      detectionModels = body.models;
+      modelsDirectory = body.directory;
+      const remembered = localStorage.getItem('boxscribe:detection-model');
+      selectedModel = detectionModels.some((model) => model.id === remembered) ? remembered! : detectionModels[0]?.id ?? '';
+    } catch (error) { detectionStatus = { error: error instanceof Error ? error.message : 'Не удалось найти ONNX-модели' }; }
+  }
+
+  async function runDetection(runAll = false) {
+    if (!currentImage || !selectedModel || detectionRun || currentImage.excluded) return;
+    // An emptied number input binds null, which would disable the threshold entirely.
+    detectionConfidence = Number.isFinite(detectionConfidence) ? Math.min(1, Math.max(0, detectionConfidence)) : 0.25;
+    const targetId = currentImage.id;
+    const selected = detectionModels.find((candidate) => candidate.id === selectedModel);
+    const models = runAll ? detectionModels : selected ? [selected] : [];
+    if (!models.length) return;
+    detectionRun = { all: runAll, progress: '' };
+    detectionStatus = null;
+    localStorage.setItem('boxscribe:detection-model', selectedModel);
+    let frame: DetectionFrame | null = null;
+    try {
+      const combined: Detection[] = [];
+      let bestScore = 0, inferenceMs = 0, totalMs = 0, sessionMs = 0, unmatched = 0;
+      const inputSizes = new Set<string>(), backends = new Set<string>();
+      frame = await openFrame(frameUrl(currentImage));
+      for (let index = 0; index < models.length; index++) {
+        const model = models[index];
+        detectionRun = { all: runAll, progress: runAll ? `${index + 1}/${models.length}` : '' };
+        const modelClasses = model.classes?.length ? model.classes : project.classes;
+        const result = await detectOnnx(`/__boxscribe/model?name=${encodeURIComponent(model.id)}`, frame, modelClasses.length, detectionConfidence);
+        if (currentId !== targetId) return;
+        bestScore = Math.max(bestScore, result.bestScore); inferenceMs += result.timings.inference; totalMs += result.timings.total; sessionMs += result.timings.session;
+        inputSizes.add(result.inputSize); backends.add(result.backend.toUpperCase());
+        combined.push(...result.detections.flatMap((box) => {
+          const modelClassName = modelClasses[box.classId];
+          const mappedClass = project.classes.findIndex((className) => className.toLowerCase() === modelClassName?.toLowerCase());
+          if (model.classes?.length && mappedClass < 0) { unmatched++; return []; }
+          return [{ ...box, classId: mappedClass >= 0 ? mappedClass : box.classId }];
+        }));
+      }
+      // In append mode existing boxes join the NMS as unbeatable entries, so a
+      // re-run never stacks duplicates over what is already annotated.
+      const existing: Detection[] = detectionMode === 'append'
+        ? boxes.map(({ classId, x, y, width, height }) => ({ classId, x, y, width, height, score: Number.POSITIVE_INFINITY }))
+        : [];
+      const next = mergeDetections([...existing, ...combined], 0.5)
+        .filter((detection) => Number.isFinite(detection.score))
+        .map(({ score, ...box }) => ({ ...box, confidence: score, id: crypto.randomUUID() }));
+      if (next.length) {
+        history.push(boxes);
+        boxes = detectionMode === 'append' ? [...boxes, ...next] : next;
+        selectedId = null; markDirty();
+      }
+      const dropped = unmatched ? ` · без совпадения классов: ${unmatched}` : '';
+      const seconds = (value: number) => value < 1000 ? `${Math.round(value)} мс` : `${(value / 1000).toFixed(1)} с`;
+      detectionStatus = {
+        message: next.length
+          ? `${runAll ? `Ансамбль ${models.length} моделей` : 'Найдено'}: ${next.length}${dropped}`
+          : bestScore > 0
+            ? `Ничего выше ${formatConfidence(detectionConfidence)} · лучший кандидат ${formatConfidence(bestScore)}${dropped}`
+            : `Кандидаты не найдены${dropped}`,
+        metrics: `${[...inputSizes].join(', ')} · ${[...backends].join('+')} · инференс ${seconds(inferenceMs)} · всего ${seconds(totalMs)}${sessionMs > 500 ? ` · запуск ${seconds(sessionMs)}` : ''}`
+      };
+    } catch (error) { detectionStatus = { error: error instanceof Error ? error.message : 'Ошибка ONNX-детекции' }; }
+    finally { frame?.close(); detectionRun = null; }
+  }
+
   function keyHandler(event: KeyboardEvent) {
     if ((event.target as HTMLElement).matches('input, textarea, select')) return;
     const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
@@ -381,8 +513,10 @@
     if (shortcuts.previous.includes(key as never)) navigate(-1);
     else if (shortcuts.next.includes(key as never)) navigate(1);
     else if (shortcuts.save.includes(key as never)) { event.preventDefault(); save(); }
+    else if (shortcuts.detectAll.includes(key as never)) { event.preventDefault(); runDetection(true); }
     else if (shortcuts.fit.includes(key as never)) canvas?.fit();
     else if (shortcuts.focus.includes(key as never)) { event.preventDefault(); browseBoxes(event.shiftKey ? -1 : 1); }
+    else if ((key === 'Delete' || key === 'Backspace') && event.shiftKey) { event.preventDefault(); clearAllBoxes(); }
     else if (key === 'Delete' || key === 'Backspace') removeSelected();
     else if (/^[1-9]$/.test(key)) changeSelectedClass(Number(key) - 1);
     else if (shortcuts.previousClass.includes(key as never)) changeSelectedClass((currentClass - 1 + (project?.classes.length ?? 1)) % (project?.classes.length ?? 1));
@@ -391,11 +525,12 @@
 
   onMount(() => {
     window.addEventListener('keydown', keyHandler);
-    if (runtimeDataset) loadRuntimeProject();
+    const requestedFrame = $page.url.searchParams.get('frame') ?? localStorage.getItem('boxscribe:last-image');
+    if (runtimeDataset) { loadRuntimeProject('', null, requestedFrame).finally(() => routeReady = true); loadDetectionModels(); }
     else {
-      const remembered = localStorage.getItem('boxscribe:last-image');
-      if (remembered && project.images.some((image) => image.id === remembered)) currentId = remembered;
+      if (requestedFrame && project.images.some((image) => image.id === requestedFrame)) currentId = requestedFrame;
       if (currentId) loadAnnotations();
+      routeReady = true;
     }
     const beforeUnload = (event: BeforeUnloadEvent) => { if (dirty) { event.preventDefault(); event.returnValue = ''; } };
     window.addEventListener('beforeunload', beforeUnload);
@@ -450,16 +585,31 @@
       {#if loadingFrame}<div class="frame-loading" role="status" aria-live="polite"><div><i class="spinner"></i><span>Загрузка кадра</span><small>{loadingFrame.name}</small></div></div>{/if}
     </section>
     <aside class="inspector">
+      <div class="panel-head assistant-head"><span>ONNX-помощник</span><small>{detectionModels.length ? `${detectionModels.length} ${detectionModels.length === 1 ? 'MODEL' : 'MODELS'}` : 'AUTO'}</small></div>
+      <div class="assistant-panel">
+        {#if detectionModels.length}
+          <select bind:value={selectedModel} aria-label="ONNX-модель">{#each detectionModels as model}<option value={model.id}>{model.name}</option>{/each}</select>
+          <label class="confidence"><span>CONF</span><input type="range" min="0" max="1" step="0.01" bind:value={detectionConfidence}/><input class="confidence-value" aria-label="Порог confidence" type="number" min="0" max="1" step="0.01" bind:value={detectionConfidence}/></label>
+          <div class="assistant-actions">
+            <div class="detection-mode"><button title="Заменить текущие bbox" class:active={detectionMode === 'replace'} on:click={() => detectionMode = 'replace'}>Заменить</button><button title="Добавить к текущим bbox" class:active={detectionMode === 'append'} on:click={() => detectionMode = 'append'}>Добавить</button></div>
+            <button class="detect-btn" on:click={() => runDetection(false)} disabled={detectionDisabled} title="Запустить выбранную модель" aria-label="Запустить выбранную модель">{#if detectionRun && !detectionRun.all}<i class="spinner"></i>{:else}<Icon name="play" size={14}/>{/if}</button>
+            <button class="detect-btn detect-all" on:click={() => runDetection(true)} disabled={detectionDisabled || detectionModels.length < 2} title="Запустить все модели и объединить bbox (R)" aria-label="Запустить все модели">{#if detectionRun?.all}<i class="spinner"></i><span>{detectionRun.progress}</span>{:else}<Icon name="play-all" size={14}/>{/if}</button>
+          </div>
+        {:else}
+          <p class="model-empty">Положите файлы <b>.onnx</b> в<br/><code title={modelsDirectory}>{modelsDirectory || 'models'}</code><br/>и обновите страницу.</p>
+        {/if}
+        {#if detectionStatus?.error}<p class="detection-status error">{detectionStatus.error}</p>{:else if detectionStatus?.message}<p class="detection-status"><b>{detectionStatus.message}</b><span>{detectionStatus.metrics}</span></p>{/if}
+      </div>
       <div class="panel-head class-mode"><span>{selectedBox ? 'Класс выбранного bbox' : 'Класс нового bbox'}</span><small>{selectedBox ? 'EDIT' : 'DRAW'}</small></div>
       <div class="class-list">
         {#each project.classes as className, index}<button class:active={currentClass === index} style={`--class-color:var(--c${index % 9})`} on:click={() => changeSelectedClass(index)}><i></i><span><b>{className}</b><small>{selectedBox ? 'Применить к выбранному' : 'Для следующего bbox'}</small></span>{#if index < 9}<kbd>{index + 1}</kbd>{/if}</button>{/each}
       </div>
-      <div class="panel-head boxes-head"><span>Объекты</span><small>{boxes.length}</small></div>
+      <div class="panel-head boxes-head"><span>Объекты</span><div class="box-panel-actions"><small>{boxes.length}</small><button on:click={clearAllBoxes} disabled={!boxes.length || Boolean(currentImage?.excluded)} title="Очистить все bbox (Shift+Delete)"><Icon name="trash" size={14}/></button></div></div>
       <div class="box-list">
-        {#each boxes as box, index}<button class:active={box.id === selectedId} on:click={() => selectBox(box.id)}><i style={`--class-color:var(--c${box.classId % 9})`}></i><span><b>{project.classes[box.classId] ?? `Класс ${box.classId}`}</b><small>#{index + 1} · {Math.round(box.width)}×{Math.round(box.height)}</small></span></button>{/each}
+        {#each boxes as box, index}<button class:active={box.id === selectedId} on:click={() => selectBox(box.id)}><i style={`--class-color:var(--c${box.classId % 9})`}></i><span><b>{project.classes[box.classId] ?? `Класс ${box.classId}`}{#if box.confidence !== undefined}<em>{formatConfidence(box.confidence)}</em>{/if}</b><small>#{index + 1} · {Math.round(box.width)}×{Math.round(box.height)}</small></span></button>{/each}
         {#if !boxes.length}<div class="empty-boxes"><span>＋</span><b>Нарисуйте первый bbox</b><small>Протяните мышью по объекту</small></div>{/if}
       </div>
-      {#if selectedBox}<div class="selection-card"><div><span>Объект <b>{selectedBoxNumber} / {boxes.length}</b></span><span class="selection-actions"><button class="box-previous" on:click={() => browseBoxes(-1, true)} title="Предыдущий объект (Shift+B)"><Icon name="chevron" size={15}/></button><button class="focus-selected" on:click={focusCurrent} title="Приблизить выбранный bbox (B)"><Icon name="focus" size={16}/></button><button on:click={() => browseBoxes(1, true)} title="Следующий объект (B)"><Icon name="chevron" size={15}/></button><button class="remove-selected" on:click={removeSelected} title="Удалить"><Icon name="trash" size={16}/></button></span></div><label><span>Класс</span><select value={selectedBox.classId} on:change={(event) => changeSelectedClass(Number(event.currentTarget.value))}>{#each project.classes as className, index}<option value={index}>{className}</option>{/each}</select></label><code>x {Math.round(selectedBox.x)} · y {Math.round(selectedBox.y)}<br/>w {Math.round(selectedBox.width)} · h {Math.round(selectedBox.height)}</code></div>{/if}
+      {#if selectedBox}<div class="selection-card"><div><span>Объект <b>{selectedBoxNumber} / {boxes.length}</b>{#if selectedBox.confidence !== undefined}<strong class="selected-confidence">CONF {formatConfidence(selectedBox.confidence)}</strong>{/if}</span><span class="selection-actions"><button class="box-previous" on:click={() => browseBoxes(-1, true)} title="Предыдущий объект (Shift+B)"><Icon name="chevron" size={15}/></button><button class="focus-selected" on:click={focusCurrent} title="Приблизить выбранный bbox (B)"><Icon name="focus" size={16}/></button><button on:click={() => browseBoxes(1, true)} title="Следующий объект (B)"><Icon name="chevron" size={15}/></button><button class="remove-selected" on:click={removeSelected} title="Удалить"><Icon name="trash" size={16}/></button></span></div><label><span>Класс</span><select value={selectedBox.classId} on:change={(event) => changeSelectedClass(Number(event.currentTarget.value))}>{#each project.classes as className, index}<option value={index}>{className}</option>{/each}</select></label><code>x {Math.round(selectedBox.x)} · y {Math.round(selectedBox.y)}<br/>w {Math.round(selectedBox.width)} · h {Math.round(selectedBox.height)}</code></div>{/if}
       <div class="hints"><span><kbd>Space</kbd> Перемещение</span><span><kbd>Scroll</kbd> Масштаб</span><span><kbd>Del</kbd> Удалить</span><span><kbd>F</kbd> Весь кадр</span></div>
     </aside>
 </main>
@@ -477,5 +627,9 @@
   .frame-loading{position:absolute;inset:0;z-index:4;display:grid;place-items:center;background:#11141966;backdrop-filter:blur(12px) saturate(.72);animation:loading-in .14s ease-out;color:#aeb5bc}.frame-loading>div{min-width:190px;max-width:min(420px,60%);padding:14px 18px;border:1px solid #343a42;background:#15191ee8;border-radius:10px;box-shadow:0 12px 34px #0008;display:grid;grid-template-columns:20px minmax(0,1fr);align-items:center;column-gap:10px;row-gap:3px}.frame-loading .spinner{grid-row:1/3;width:17px;height:17px}.frame-loading span{font-size:11px;font-weight:650}.frame-loading small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#68717a;font:9px ui-monospace}@keyframes loading-in{from{opacity:0;backdrop-filter:blur(0) saturate(1)}to{opacity:1;backdrop-filter:blur(12px) saturate(.72)}}
   .filter-block{padding:9px 12px 10px;border-top:1px solid #252a30;border-bottom:1px solid #252a30;background:#15191e}.filter-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}.filter-title>span,.status-filter>span,.status-locked>span{color:#666e76;font:650 8px ui-monospace;text-transform:uppercase;letter-spacing:.12em}.filter-title>small{color:#50575f;font:600 8px ui-monospace}.object-filter .class-filters{padding:0;gap:5px}.status-filter{padding:8px 12px 10px;display:grid;grid-template-columns:45px 1fr;align-items:center;gap:5px}.status-filter .filters{padding:0;gap:2px}.status-filter .filters button{padding:5px 6px}.status-locked{height:39px;padding:0 12px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #252a30}.status-locked>b{display:flex;align-items:center;gap:6px;color:#8d959d;font-size:9px;font-weight:600}.status-locked>b i{width:6px;height:6px;border-radius:50%;background:#77e6a1;box-shadow:0 0 0 3px #77e6a112}
   .status-filter{align-items:center}.status-filter .filters{min-width:0;overflow-x:auto;flex-wrap:nowrap;scrollbar-width:none}.status-filter .filters::-webkit-scrollbar{display:none}.status-filter .filters button{flex:none;white-space:nowrap}.image-row{position:relative;min-height:58px;border-bottom:1px solid #22262b;display:flex;align-items:center;background:transparent}.image-row:hover{background:#1a1e24}.image-row.active{background:#20252b;box-shadow:inset 3px 0 #e9ff70}.image-row.excluded:not(.active){background:#17191d}.image-row.excluded .file b{color:#848b92;text-decoration:line-through;text-decoration-color:#596067}.image-row.excluded .status{opacity:.5}.image-open{min-width:0;flex:1;align-self:stretch;padding:10px 4px 10px 11px;border:0;background:transparent;color:#cfd3d7;text-align:left;display:flex;align-items:center;gap:9px;cursor:pointer}.exclude-toggle{width:26px;height:28px;padding:0;flex:none;display:grid;place-items:center;border:0;border-radius:5px;background:transparent;color:#555d65;cursor:pointer}.exclude-toggle:hover{background:#ff8d7210;color:#ff8d72}.exclude-toggle.active{color:#ff8d72;background:#ff8d720c}.exclude-toggle.active:hover{color:#e9ff70;background:#e9ff7010}.exclude-toggle:disabled{opacity:.45;cursor:wait}.image-row .number{width:32px;padding-right:9px;text-align:right;flex:none}
+  .assistant-head small{color:#8a929a}.assistant-panel{padding:8px 9px 9px;border-bottom:1px solid #2b2e34;background:#14171c;display:flex;flex-direction:column;gap:7px}.assistant-panel>select{width:100%;height:28px;border:1px solid #343a42;border-radius:6px;background:#101318;color:#c5cbd0;padding:0 8px;font:600 9px ui-monospace;outline:none}.assistant-panel>select:hover,.assistant-panel>select:focus{border-color:#4b535c}.confidence{height:20px;display:grid;grid-template-columns:32px minmax(0,1fr) 40px;align-items:center;gap:7px;color:#687078;font:600 8px ui-monospace;text-transform:uppercase;letter-spacing:.06em}.confidence input{width:100%;height:3px;margin:0;accent-color:#aabd4c;cursor:pointer}.assistant-actions{display:grid;grid-template-columns:minmax(0,1fr) 58px 42px;gap:5px}.detection-mode{height:27px;padding:2px;display:grid;grid-template-columns:1fr 1fr;gap:2px;border:1px solid #30363d;border-radius:6px;background:#111419}.detection-mode button{min-width:0;padding:0 3px;border:0;border-radius:4px;background:transparent;color:#646c74;font-size:8px;cursor:pointer}.detection-mode button:hover{color:#aeb5bb}.detection-mode button.active{background:#262c31;color:#cdd2d6}.detect-btn{height:27px;padding:0 5px;border:1px solid #596326;border-radius:6px;background:#e9ff700b;color:#ddef68;font-size:8px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:3px;cursor:pointer}.detect-btn:hover{background:#e9ff7013;border-color:#768333}.detect-btn:disabled{opacity:.55;cursor:wait}.detect-btn .spinner{width:10px;height:10px;border-width:1.5px}.detect-all{border-color:#758231;background:#e9ff7012}.detection-status,.model-empty{margin:0;color:#747c84;font-size:8px;line-height:1.4}.detection-status{padding:5px 7px;border-radius:5px;background:#1a1e23;display:flex;flex-direction:column;gap:2px}.detection-status>b{color:#aeb5bc;font-size:8px}.detection-status>span{color:#626a72;font:7px ui-monospace}.detection-status.error{color:#ff8d72;background:#ff8d7208}.model-empty{text-align:center;padding:5px 0}.model-empty code{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#aeb5bc;font-size:8px;vertical-align:bottom}
+  .box-list button b{display:flex;align-items:center;gap:6px}.box-list button b em{padding:2px 4px;border-radius:4px;background:#e9ff7010;color:#e9ff70;font:700 8px ui-monospace;font-style:normal}.selected-confidence{padding:2px 5px;border-radius:4px;background:#e9ff7010;color:#e9ff70;font:700 8px ui-monospace;letter-spacing:0}
+  .confidence{grid-template-columns:32px minmax(0,1fr) 48px}.confidence .confidence-value{width:48px;height:20px;padding:0 3px;border:1px solid #343a42;border-radius:4px;background:#101318;color:#9fa7ae;font:650 8px ui-monospace;text-align:center;outline:none;-moz-appearance:textfield;appearance:textfield}.confidence .confidence-value::-webkit-inner-spin-button,.confidence .confidence-value::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}.confidence .confidence-value:focus{border-color:#65702d;color:#ddef68}.box-panel-actions{display:flex;align-items:center;gap:5px}.box-panel-actions button{width:25px;height:25px;padding:0;border:0;border-radius:5px;background:transparent;color:#596169;display:grid;place-items:center;cursor:pointer}.box-panel-actions button:hover:not(:disabled){background:#ff8d7210;color:#ff8d72}.box-panel-actions button:disabled{opacity:.3;cursor:default}
+  .assistant-actions{grid-template-columns:minmax(0,1fr) 32px 32px}.detect-btn{position:relative;padding:0}.detect-btn :global(svg){display:block}
   @media(max-width:1100px){.app-shell{--side:220px;--inspect:220px}}
 </style>
